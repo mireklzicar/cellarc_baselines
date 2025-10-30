@@ -1,0 +1,58 @@
+# @package _global_
+defaults:
+  - /model/size: small
+  - _self_
+
+seed: 1337
+
+dataset:
+  benchmark: cellarc_100k
+  train_split: train
+  eval_split: val_rho20
+  include_metadata: false
+  root: null
+
+data:
+  batch_size: 8
+  num_workers: 0
+  max_seq_len: 1024
+  drop_long_episodes: true
+  shuffle: false
+
+tokens:
+  num_colors: 10
+  pad_id: 10
+  support_input_id: 11
+  support_output_id: 12
+  query_id: 13
+  target_id: 14
+  mask_id: 15
+  eos_id: 16
+
+model:
+  architecture: rnn
+  dtype: float32
+  device: auto
+
+optimizer:
+  name: adamw
+  lr: 0.0005
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  warmup_steps: 0
+
+trainer:
+  max_steps: 10000
+  eval_every: 500
+  log_every: 50
+  gradient_accumulation: 1
+  clip_grad_norm: null
+  max_eval_episodes: 256
+
+loss:
+  ignore_index: -100
+
+eval:
+  batch_size: 8
+  limit: null

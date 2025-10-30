@@ -1,0 +1,51 @@
+# @package model.size
+size: small
+variants:
+  rnn:
+    hidden_size: 160
+  transformer:
+    embedding_dim: 56
+    num_layers: 2
+    num_heads: 4
+    dropout_prob: 0.1
+    widening_factor: 1
+  cnn1d:
+    embedding_dim: 64
+    hidden_channels: 160
+    num_layers: 2
+    dropout: 0.1
+  tiny_recursive:
+    hidden_size: 96
+    H_layers: 1
+    L_layers: 1
+    H_cycles: 1
+    L_cycles: 1
+    halt_max_steps: 1
+  hrm:
+    hidden_size: 56
+    H_layers: 1
+    L_layers: 1
+    H_cycles: 1
+    L_cycles: 1
+    halt_max_steps: 1
+    expansion: 1.5
+    num_heads: 2
+    pos_encodings: rope
+    halt_exploration_prob: 0.0
+    forward_dtype: float32
+    mlp_t: false
+  tape_rnn:
+    hidden_size: 120
+    memory_cell_size: 44
+    memory_size: 22
+    n_tapes: 1
+    mlp_layers_size: [96, 96]
+    inner_core: lstm
+    input_window: 1
+  stack_rnn:
+    hidden_size: 128
+    stack_cell_size: 48
+    stack_size: 24
+    n_stacks: 1
+    inner_core: lstm
+    input_window: 1

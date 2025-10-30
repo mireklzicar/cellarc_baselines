@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - default
+  - _self_
+
+dataset:
+  train_split: val_rho20
+  eval_split: val_rho20
+
+data:
+  batch_size: 2
+  max_seq_len: 512
+
+trainer:
+  max_steps: 5
+  eval_every: 5
+  log_every: 1
+  max_eval_episodes: 8
+
+eval:
+  batch_size: 2
+  limit: 16
