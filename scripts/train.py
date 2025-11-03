@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from baselines import BaselineConfig, create_baseline, get_baseline_registry
-from cell_arc import EpisodeDataset
+from cellarc import EpisodeDataset
 
 
 LOGGER = logging.getLogger(__name__)

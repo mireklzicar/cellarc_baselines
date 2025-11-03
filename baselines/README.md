@@ -1,9 +1,15 @@
 # Baselines
 
-This directory collects a handful of sequence-to-sequence baselines that can be
-run against the processed ARC-style benchmarks in `data/benchmark_1M_processed`.
-Every baseline exposes the same constructor and forward signature via
-`baselines.create_baseline`, making it easy to swap models inside scripts.
+This directory collects a handful of baselines that can be run against the
+processed ARC-style benchmarks in `data/benchmark_1M_processed`. The code is
+organised into three subpackages:
+
+- `neural/` – PyTorch sequence models wired into the unified training loop via
+  `baselines.create_baseline`.
+- `symbolic/` – Lightweight algorithmic solvers available through
+  `baselines.symbolic.create_symbolic_baseline` and the Hydra-driven evaluation
+  script `scripts/eval_symbolic.py`.
+- `llm/` – Placeholders for large-language-model-based approaches.
 
 ## Included models
 
@@ -26,5 +32,4 @@ Every baseline exposes the same constructor and forward signature via
   additional batching logic similar to the TRM wrapper.
 
 All recursive reasoning utilities from the upstream projects are vendored under
-`baselines/recursive_reasoning`.
-
+`baselines/neural/recursive_reasoning`.

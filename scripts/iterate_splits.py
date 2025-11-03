@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from typing import Sequence
 
-from cell_arc import EpisodeDataset
+from cellarc import EpisodeDataset
 from tqdm.auto import tqdm
 
 
@@ -46,7 +46,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--benchmark",
         default="cellarc_100k",
-        help="Remote benchmark name registered with cell_arc (default: cellarc_100k).",
+        help="Remote benchmark name registered with cellarc (default: cellarc_100k).",
     )
     parser.add_argument(
         "--root",

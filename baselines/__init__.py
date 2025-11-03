@@ -7,12 +7,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .cnn.cnn1d import CNN1DSeq2Seq
-from .recursive_reasoning import HierarchicalReasoningModel_ACTV1, TinyRecursiveReasoningModel_ACTV1
-from .rnn import RNNModel
-from .rnn.stack_rnn import StackRNNCore
-from .rnn.tape_rnn import TapeInputLengthJumpCore
-from .transformer import make_transformer
+from .neural.cnn.cnn1d import CNN1DSeq2Seq
+from .neural.recursive_reasoning import (
+    HierarchicalReasoningModel_ACTV1,
+    TinyRecursiveReasoningModel_ACTV1,
+)
+from .neural.nca.nca1d import NCA1DSeq2Seq
+from .neural.rnn.rnn import RNNModel
+from .neural.rnn.stack_rnn import StackRNNCore
+from .neural.rnn.tape_rnn import TapeInputLengthJumpCore
+from .neural.transformer import make_transformer
 
 
 @dataclass
@@ -391,6 +395,11 @@ def _build_stack_rnn(config: BaselineConfig) -> nn.Module:
     return model.to(config.device, dtype=config.dtype)
 
 
+def _build_nca1d(config: BaselineConfig) -> nn.Module:
+    model = NCA1DSeq2Seq(config, **dict(config.model_kwargs))
+    return model.to(config.device, dtype=config.dtype)
+
+
 BASELINE_REGISTRY: Dict[str, Callable[[BaselineConfig], nn.Module]] = {
     "rnn": _build_rnn,
     "transformer": _build_transformer,
@@ -400,6 +409,7 @@ BASELINE_REGISTRY: Dict[str, Callable[[BaselineConfig], nn.Module]] = {
     "hrm": _build_hierarchical_recursive,
     "tape_rnn": _build_tape_rnn,
     "stack_rnn": _build_stack_rnn,
+    "nca1d": _build_nca1d,
 }
 
 
@@ -426,6 +436,7 @@ __all__ = [
     "TapeRNNSeq2Seq",
     "StackRNNSeq2Seq",
     "TransformerSeq2Seq",
+    "NCA1DSeq2Seq",
     "create_baseline",
     "get_baseline_registry",
 ]
