@@ -15,13 +15,13 @@ variants:
     num_layers: 2
     dropout: 0.1
   nca1d:
-    channel_size: 64
-    hidden_size: 256
+    channel_size: 80
+    hidden_size: 320
     num_steps: 48
     num_kernels: 2
     kernel_size: 3
     cell_dropout_rate: 0.1
-    input_embedding_dim: 32
+    input_embedding_dim: 48
   tiny_recursive:
     hidden_size: 96
     H_layers: 1

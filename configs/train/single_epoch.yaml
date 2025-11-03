@@ -8,7 +8,7 @@ seed: 1337
 dataset:
   benchmark: cellarc_100k
   train_split: train
-  train_eval_splits: [train_interpolation, train_extrapolation]
+  train_eval_splits: [train]
   eval_splits: [val]
   test_splits: [test_interpolation, test_extrapolation]
   include_metadata: false

@@ -584,7 +584,7 @@ def prepare_baseline_model(
 
     requested_device = str(cfg.model.device)
     device = detect_device(requested_device)
-    cpu_only_architectures = {"tiny_recursive", "trm", "hrm"}
+    cpu_only_architectures: set[str] = set()
     if architecture in cpu_only_architectures and device.type != "cpu":
         LOGGER.warning(
             "Architecture '%s' only supports CPU execution. Overriding requested device '%s' with CPU.",

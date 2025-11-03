@@ -375,14 +375,13 @@ def _build_cnn(config: BaselineConfig) -> nn.Module:
 
 
 def _build_tiny_recursive(config: BaselineConfig) -> nn.Module:
-    # Tiny recursive baseline relies on custom buffers that behave best on CPU.
     model = TinyRecursiveSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(torch.device("cpu"))
+    return model.to(config.device, dtype=config.dtype)
 
 
 def _build_hierarchical_recursive(config: BaselineConfig) -> nn.Module:
     model = HierarchicalReasoningSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(torch.device("cpu"))
+    return model.to(config.device, dtype=config.dtype)
 
 
 def _build_tape_rnn(config: BaselineConfig) -> nn.Module:

@@ -10,8 +10,6 @@ ARCHES=(
   nca1d
   tiny_recursive
   hrm
-  tape_rnn
-  stack_rnn
 )
 
 for arch in "${ARCHES[@]}"; do
@@ -19,6 +17,7 @@ for arch in "${ARCHES[@]}"; do
   python "$(dirname "${BASH_SOURCE[0]}")/train.py" \
     --config-name train/single_epoch \
     model.architecture="${arch}" \
+    trainer.checkpoints.enabled=true \
     logging.wandb.enabled=true \
-    logging.wandb.project=ca_tmp_new
+    logging.wandb.project=ca_tmp_new_2
 done
