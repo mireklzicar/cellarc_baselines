@@ -23,37 +23,55 @@ variants:
     cell_dropout_rate: 0.1
     input_embedding_dim: 128
   tiny_recursive:
-    hidden_size: 544
+    name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 3
+    L_cycles: 6
+    H_layers: 0
+    L_layers: 2
+    hidden_size: 608
+    num_heads: 8  # min(2, hidden_size // 64)
+    expansion: 4
+    puzzle_emb_ndim: ${.hidden_size}
+    pos_encodings: rope
+    forward_dtype: bfloat16
+    mlp_t: false  # use mlp on L instead of transformer
+    puzzle_emb_len: 16
+    no_ACT_continue: true  # No continue ACT loss, rely on halt sigmoid
+  hrm:
+    name: recursive_reasoning.hrm@HierarchicalReasoningModel_ACTV1
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 2
+    L_cycles: 2
     H_layers: 4
     L_layers: 4
-    H_cycles: 2
-    L_cycles: 2
-    halt_max_steps: 2
-  hrm:
-    hidden_size: 432
-    H_layers: 3
-    L_layers: 3
-    H_cycles: 2
-    L_cycles: 2
-    halt_max_steps: 2
-    expansion: 1.9
-    num_heads: 8
+    hidden_size: 320
+    num_heads: 8  # min(2, hidden_size // 64)
+    expansion: 4
+    puzzle_emb_ndim: ${.hidden_size}
     pos_encodings: rope
-    halt_exploration_prob: 0.0
-    forward_dtype: float32
+    forward_dtype: bfloat16
     mlp_t: false
-  tape_rnn:
-    hidden_size: 1280
-    memory_cell_size: 384
-    memory_size: 120
-    n_tapes: 1
-    mlp_layers_size: [640, 640]
-    inner_core: lstm
-    input_window: 1
-  stack_rnn:
-    hidden_size: 1344
-    stack_cell_size: 400
-    stack_size: 128
-    n_stacks: 1
-    inner_core: lstm
-    input_window: 1
+  transformer_act:
+    name: recursive_reasoning.transformers_baseline@Model_ACTV2
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 1  # kept for compatibility
+    H_layers: 8
+    hidden_size: 512
+    num_heads: 12
+    expansion: 4
+    puzzle_emb_ndim: ${.hidden_size}
+    pos_encodings: rope
+    forward_dtype: bfloat16

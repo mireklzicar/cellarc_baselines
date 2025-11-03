@@ -23,37 +23,40 @@ variants:
     cell_dropout_rate: 0.1
     input_embedding_dim: 96
   tiny_recursive:
-    hidden_size: 224
-    H_layers: 2
+    name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 3
+    L_cycles: 6
+    H_layers: 0
     L_layers: 2
-    H_cycles: 1
-    L_cycles: 1
-    halt_max_steps: 1
-  hrm:
-    hidden_size: 168
-    H_layers: 2
-    L_layers: 2
-    H_cycles: 1
-    L_cycles: 1
-    halt_max_steps: 1
-    expansion: 1.6
+    hidden_size: 192
     num_heads: 4
+    expansion: 2.3
+    puzzle_emb_ndim: ${.hidden_size}
     pos_encodings: rope
-    halt_exploration_prob: 0.0
-    forward_dtype: float32
+    forward_dtype: bfloat16
     mlp_t: false
-  tape_rnn:
-    hidden_size: 416
-    memory_cell_size: 104
-    memory_size: 40
-    n_tapes: 1
-    mlp_layers_size: [208, 208]
-    inner_core: lstm
-    input_window: 1
-  stack_rnn:
-    hidden_size: 448
-    stack_cell_size: 112
-    stack_size: 42
-    n_stacks: 1
-    inner_core: lstm
-    input_window: 1
+    puzzle_emb_len: 12
+    no_ACT_continue: true
+  hrm:
+    name: recursive_reasoning.hrm@HierarchicalReasoningModel_ACTV1
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 2
+    L_cycles: 2
+    H_layers: 4
+    L_layers: 4
+    hidden_size: 96
+    num_heads: 4
+    expansion: 2.0
+    puzzle_emb_ndim: ${.hidden_size}
+    pos_encodings: rope
+    forward_dtype: bfloat16
+    mlp_t: false

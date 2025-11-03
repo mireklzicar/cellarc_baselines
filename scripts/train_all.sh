@@ -13,8 +13,6 @@ ARCHES=(
   nca1d
   tiny_recursive
   hrm
-  tape_rnn
-  stack_rnn
 )
 
 train_band() {
@@ -23,15 +21,15 @@ train_band() {
   for arch in "${ARCHES[@]}"; do
     echo "--- Training '${arch}' (${size}) ---"
     python "${TRAIN_PY}" \
-      --config-name train/single_epoch \
+      --config-name train/default \
       model.architecture="${arch}" \
       model.size="${size}" \
       trainer.checkpoints.enabled=true \
       logging.wandb.enabled=true \
-      logging.wandb.project=ca_tmp_new_2
+      logging.wandb.project="cellarc100k_neural_baselines_${size}"
   done
 }
 
-train_band small
+# train_band small
 train_band medium
 train_band large

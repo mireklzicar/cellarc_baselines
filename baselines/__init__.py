@@ -10,6 +10,7 @@ from torch import nn
 from .neural.cnn.cnn1d import CNN1DSeq2Seq
 from .neural.recursive_reasoning import (
     HierarchicalReasoningModel_ACTV1,
+    Model_ACTV2,
     TinyRecursiveReasoningModel_ACTV1,
 )
 from .neural.nca.nca1d import NCA1DSeq2Seq
@@ -244,6 +245,81 @@ class HierarchicalReasoningSeq2Seq(nn.Module):
         return outputs["logits"]
 
 
+class TransformerACTSeq2Seq(nn.Module):
+    """Transformer-only variant of the ACT-based recursive reasoning baseline."""
+
+    def __init__(
+        self,
+        config: BaselineConfig,
+        **model_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        vocab_size = max(config.input_vocab_size, config.output_vocab_size)
+        hidden_size = int(model_kwargs.pop("hidden_size", 256))
+        H_cycles = int(model_kwargs.pop("H_cycles", 1))
+        H_layers = int(model_kwargs.pop("H_layers", 1))
+        expansion = float(model_kwargs.pop("expansion", 2.0))
+        num_heads = int(model_kwargs.pop("num_heads", 4))
+        pos_encodings = str(model_kwargs.pop("pos_encodings", "rope"))
+        halt_max_steps = int(model_kwargs.pop("halt_max_steps", 1))
+        halt_exploration_prob = float(model_kwargs.pop("halt_exploration_prob", 0.0))
+        forward_dtype = str(model_kwargs.pop("forward_dtype", "bfloat16"))
+        puzzle_emb_ndim = int(model_kwargs.pop("puzzle_emb_ndim", 0))
+        num_puzzle_identifiers = int(
+            model_kwargs.pop("num_puzzle_identifiers", max(1, config.batch_size))
+        )
+
+        config_dict = {
+            "batch_size": config.batch_size,
+            "seq_len": config.max_seq_len,
+            "puzzle_emb_ndim": puzzle_emb_ndim,
+            "num_puzzle_identifiers": num_puzzle_identifiers,
+            "vocab_size": vocab_size,
+            "H_cycles": H_cycles,
+            "H_layers": H_layers,
+            "hidden_size": hidden_size,
+            "expansion": expansion,
+            "num_heads": num_heads,
+            "pos_encodings": pos_encodings,
+            "halt_max_steps": halt_max_steps,
+            "halt_exploration_prob": halt_exploration_prob,
+            "forward_dtype": forward_dtype,
+        }
+
+        optional_fields = (
+            "rms_norm_eps",
+            "rope_theta",
+            "act_enabled",
+            "act_inference",
+        )
+        for field in optional_fields:
+            value = model_kwargs.pop(field, None)
+            if value is not None:
+                config_dict[field] = value
+
+        config_dict.update({k: v for k, v in model_kwargs.items() if v is not None})
+        self.model = Model_ACTV2(config_dict)
+        self.requires_targets = False
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del targets  # unused
+        device = self.model.inner.H_init.device
+        inputs = inputs.to(device=device)
+        batch = {
+            "inputs": inputs.to(torch.int32),
+            "puzzle_identifiers": torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            ),
+        }
+        carry = self.model.initial_carry(batch)
+        _, outputs = self.model(carry, batch)
+        return outputs["logits"]
+
+
 class TapeRNNSeq2Seq(nn.Module):
     """Sequence-to-sequence wrapper for the differentiable tape RNN core."""
 
@@ -384,6 +460,11 @@ def _build_hierarchical_recursive(config: BaselineConfig) -> nn.Module:
     return model.to(config.device, dtype=config.dtype)
 
 
+def _build_transformer_act(config: BaselineConfig) -> nn.Module:
+    model = TransformerACTSeq2Seq(config, **dict(config.model_kwargs))
+    return model.to(config.device, dtype=config.dtype)
+
+
 def _build_tape_rnn(config: BaselineConfig) -> nn.Module:
     model = TapeRNNSeq2Seq(config, **dict(config.model_kwargs))
     return model.to(config.device, dtype=config.dtype)
@@ -406,6 +487,7 @@ BASELINE_REGISTRY: Dict[str, Callable[[BaselineConfig], nn.Module]] = {
     "tiny_recursive": _build_tiny_recursive,
     "trm": _build_tiny_recursive,
     "hrm": _build_hierarchical_recursive,
+    "transformer_act": _build_transformer_act,
     "tape_rnn": _build_tape_rnn,
     "stack_rnn": _build_stack_rnn,
     "nca1d": _build_nca1d,
@@ -432,6 +514,7 @@ __all__ = [
     "RNNSeq2Seq",
     "TinyRecursiveSeq2Seq",
     "HierarchicalReasoningSeq2Seq",
+    "TransformerACTSeq2Seq",
     "TapeRNNSeq2Seq",
     "StackRNNSeq2Seq",
     "TransformerSeq2Seq",
