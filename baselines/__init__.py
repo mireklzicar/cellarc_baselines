@@ -157,15 +157,23 @@ class TinyRecursiveSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
@@ -230,15 +238,23 @@ class HierarchicalReasoningSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
@@ -305,15 +321,23 @@ class TransformerACTSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
