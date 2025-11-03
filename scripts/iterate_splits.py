@@ -40,8 +40,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=("train", "val", "test"),
-        help="Split names to iterate (default: train val test).",
+        default=("train", "val", "test_interpolation", "test_extrapolation"),
+        help="Split names to iterate (default: train val test_interpolation test_extrapolation).",
     )
     parser.add_argument(
         "--benchmark",

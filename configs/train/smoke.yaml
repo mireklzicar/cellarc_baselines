@@ -4,19 +4,27 @@ defaults:
   - _self_
 
 dataset:
-  train_split: val_rho20
-  eval_split: val_rho20
+  train_split: val
+  eval_splits: [val]
+  test_splits: [test_interpolation, test_extrapolation]
 
 data:
   batch_size: 2
-  max_seq_len: 512
+  max_seq_len: 272
+  augmentation:
+    enabled: false
 
 trainer:
+  num_epochs: null
   max_steps: 5
   eval_every: 5
   log_every: 1
   max_eval_episodes: 8
 
 eval:
+  batch_size: 2
+  limit: 16
+
+test:
   batch_size: 2
   limit: 16
