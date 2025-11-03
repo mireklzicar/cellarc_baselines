@@ -50,7 +50,7 @@ optimizer:
   warmup_steps: 0
 
 trainer:
-  num_epochs: 10
+  num_epochs: 1
   max_steps: null
   eval_every: null
   log_every: 50

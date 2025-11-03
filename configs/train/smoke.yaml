@@ -5,6 +5,7 @@ defaults:
 
 dataset:
   train_split: val
+  train_eval_splits: []
   eval_splits: [val]
   test_splits: [test_interpolation, test_extrapolation]
 

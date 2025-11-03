@@ -7,10 +7,13 @@ import logging
 import os
 import random
 import sys
-from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+import json
+import shutil
 
 import hydra
 import numpy as np
@@ -347,6 +350,219 @@ def init_wandb(cfg: DictConfig) -> Tuple[Optional[Any], Optional[Any]]:
     return run, wandb
 
 
+def _sanitize_path_component(value: str) -> str:
+    """Convert an arbitrary string into a filesystem-friendly component."""
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value).strip()
+    )
+    cleaned = cleaned.strip("._")
+    return cleaned or "default"
+
+
+def resolve_checkpoint_directory(
+    *,
+    checkpoint_cfg: DictConfig,
+    wandb_cfg: Optional[DictConfig],
+    wandb_run: Optional[Any],
+) -> Optional[Path]:
+    """Determine the checkpoint directory inside the Hydra outputs tree."""
+
+    base_outputs = Path(get_original_cwd()) / "outputs"
+    base_outputs.mkdir(parents=True, exist_ok=True)
+
+    use_wandb = (
+        wandb_cfg is not None
+        and bool(wandb_cfg.get("enabled", False))
+        and wandb_run is not None
+    )
+
+    if use_wandb:
+        project = wandb_cfg.get("project") or getattr(wandb_run, "project", None) or "wandb"
+        run_name = (
+            getattr(wandb_run, "name", None)
+            or wandb_cfg.get("name")
+            or getattr(wandb_run, "id", None)
+        )
+        if not run_name:
+            run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        subdir = Path(_sanitize_path_component(project)) / _sanitize_path_component(run_name)
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        subdir = Path(_sanitize_path_component(timestamp))
+
+    checkpoint_dir = base_outputs / subdir
+    if checkpoint_dir.exists() and not bool(checkpoint_cfg.get("overwrite", False)):
+        prompt = f"Checkpoint directory '{checkpoint_dir}' already exists. Overwrite? [y/N]: "
+        try:
+            response = input(prompt)
+        except EOFError:
+            LOGGER.warning(
+                "No interactive input available to confirm overwrite of %s. "
+                "Disabling checkpoint saving.",
+                checkpoint_dir,
+            )
+            return None
+        if response.strip().lower() not in {"y", "yes"}:
+            LOGGER.info(
+                "User declined to overwrite existing checkpoint directory %s. "
+                "Checkpoints will not be saved.",
+                checkpoint_dir,
+            )
+            return None
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir
+
+
+@dataclass
+class CheckpointManager:
+    """Handle saving last/best neural baseline checkpoints and evaluation summaries."""
+
+    directory: Path
+    best_accuracy: float = field(default_factory=lambda: float("-inf"))
+    best_epoch: Optional[int] = None
+    best_step: Optional[int] = None
+    best_metrics: Optional[Dict[str, float]] = None
+    best_by_split: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    last_eval_metrics: Optional[Dict[str, float]] = None
+    last_eval_by_split: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    last_epoch: Optional[int] = None
+    last_step: Optional[int] = None
+    _best_saved: bool = field(default=False, init=False)
+    _last_path: Path = field(init=False)
+    _best_path: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._last_path = self.directory / "model_last.pt"
+        self._best_path = self.directory / "model_best.pt"
+
+    @property
+    def last_path(self) -> Path:
+        return self._last_path
+
+    @property
+    def best_path(self) -> Path:
+        return self._best_path
+
+    def save_last(self, model: torch.nn.Module) -> None:
+        """Persist the current model state as the latest checkpoint."""
+        torch.save(model.state_dict(), self._last_path)
+
+    def record_evaluation(
+        self,
+        *,
+        model: torch.nn.Module,
+        aggregated_metrics: Dict[str, float],
+        metrics_by_split: Dict[str, Dict[str, float]],
+        epoch: Optional[int],
+        step: Optional[int],
+    ) -> None:
+        """Track evaluation results and update the best checkpoint if needed."""
+
+        self.last_eval_metrics = dict(aggregated_metrics) if aggregated_metrics else None
+        self.last_eval_by_split = {
+            split: dict(values) for split, values in metrics_by_split.items()
+        }
+        self.last_epoch = epoch
+        self.last_step = step
+
+        if (
+            epoch is not None
+            and aggregated_metrics
+            and "accuracy" in aggregated_metrics
+        ):
+            accuracy = float(aggregated_metrics["accuracy"])
+            if accuracy > self.best_accuracy:
+                self.best_accuracy = accuracy
+                self.best_epoch = epoch
+                self.best_step = step
+                self.best_metrics = dict(aggregated_metrics)
+                self.best_by_split = {
+                    split: dict(values) for split, values in metrics_by_split.items()
+                }
+                torch.save(model.state_dict(), self._best_path)
+                self._best_saved = True
+                LOGGER.info(
+                    "New best checkpoint (accuracy=%.4f) at epoch %s step %s saved to %s",
+                    accuracy,
+                    epoch,
+                    step,
+                    self._best_path,
+                )
+
+    def finalize(
+        self,
+        *,
+        total_steps: int,
+        test_metrics_by_split: Dict[str, Dict[str, float]],
+        test_aggregated_metrics: Dict[str, float],
+    ) -> None:
+        """Write evaluation summaries and ensure both checkpoint files exist."""
+
+        if not self._best_saved and self._last_path.exists():
+            shutil.copyfile(self._last_path, self._best_path)
+            self._best_saved = True
+            if self.best_metrics is None and self.last_eval_metrics is not None:
+                self.best_metrics = dict(self.last_eval_metrics)
+                self.best_by_split = {
+                    split: dict(values) for split, values in self.last_eval_by_split.items()
+                }
+                accuracy = self.best_metrics.get("accuracy")
+                if accuracy is not None:
+                    self.best_accuracy = float(accuracy)
+                self.best_epoch = self.last_epoch
+                self.best_step = self.last_step
+            LOGGER.info(
+                "Copied model_last.pt to model_best.pt because no epoch-based best checkpoint was recorded."
+            )
+
+        summary: Dict[str, Any] = {
+            "checkpoint_dir": str(self.directory),
+            "artifacts": {
+                "model_last": self._last_path.name,
+                "model_best": self._best_path.name,
+            },
+            "train": {"steps": int(total_steps)},
+        }
+
+        if self.best_metrics is not None:
+            accuracy = self.best_metrics.get("accuracy")
+            summary["best_eval"] = {
+                "epoch": self.best_epoch,
+                "step": self.best_step,
+                "aggregated": dict(self.best_metrics),
+                "per_split": {
+                    split: dict(values) for split, values in self.best_by_split.items()
+                },
+            }
+            if accuracy is not None:
+                summary["best_eval"]["accuracy"] = float(accuracy)
+
+        if self.last_eval_metrics is not None:
+            summary["last_eval"] = {
+                "epoch": self.last_epoch,
+                "step": self.last_step,
+                "aggregated": dict(self.last_eval_metrics),
+                "per_split": {
+                    split: dict(values) for split, values in self.last_eval_by_split.items()
+                },
+            }
+
+        if test_aggregated_metrics:
+            summary["test"] = {
+                "aggregated": dict(test_aggregated_metrics),
+                "per_split": {
+                    split: dict(values) for split, values in test_metrics_by_split.items()
+                },
+            }
+
+        summary_path = self.directory / "evaluation.json"
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+        LOGGER.info("Wrote evaluation summary to %s", summary_path)
+
+
 def prepare_baseline_model(
     cfg: DictConfig, tokens: TokenVocabulary
 ) -> tuple[torch.nn.Module, torch.device]:
@@ -429,87 +645,41 @@ def compute_batch_loss(
     }
 
 
-def compute_moving_average(
-    window: Deque[Tuple[float, int, int]]
-) -> Optional[Tuple[float, float]]:
-    """Compute loss and accuracy averaged over the most recent optimisation steps."""
-
-    if not window:
-        return None
-
-    total_tokens = sum(tokens for _, _, tokens in window)
-    if total_tokens <= 0:
-        return None
-
-    total_loss = sum(loss for loss, _, _ in window)
-    total_correct = sum(correct for _, correct, _ in window)
-    return total_loss / total_tokens, total_correct / total_tokens
-
-
 def log_training_metrics(
     *,
     epoch: int,
     step: int,
     lr: float,
-    interval_loss: float,
-    interval_correct: int,
-    interval_tokens: int,
-    cumulative_loss: float,
-    cumulative_correct: int,
-    cumulative_tokens: int,
+    loss_sum: float,
+    correct: int,
+    tokens: int,
     wandb_module: Optional[Any],
-    moving_avg_loss: Optional[float] = None,
-    moving_avg_accuracy: Optional[float] = None,
-    moving_avg_window: Optional[int] = None,
 ) -> Dict[str, float]:
-    """Log windowed and cumulative training metrics to console and (optionally) W&B."""
+    """Log per-batch training metrics to the console and optionally to Weights & Biases."""
 
-    if interval_tokens <= 0:
-        raise ValueError("Attempted to log training metrics without any interval tokens.")
+    if tokens <= 0:
+        raise ValueError("Attempted to log training metrics without any batch tokens.")
 
-    window_loss = interval_loss / interval_tokens
-    window_accuracy = interval_correct / interval_tokens if interval_tokens else 0.0
-    cumulative_loss_avg = (
-        cumulative_loss / cumulative_tokens if cumulative_tokens else window_loss
-    )
-    cumulative_accuracy = (
-        cumulative_correct / cumulative_tokens if cumulative_tokens else window_accuracy
-    )
+    loss = loss_sum / tokens
+    accuracy = correct / tokens if tokens else 0.0
 
     LOGGER.info(
-        (
-            "epoch=%d step=%d lr=%.3e "
-            "loss_win=%.4f acc_win=%.2f%% "
-            "loss_cum=%.4f acc_cum=%.2f%% "
-            "tokens_win=%d tokens_total=%d"
-        ),
+        "epoch=%d step=%d lr=%.3e loss=%.4f acc=%.2f%% tokens=%d",
         epoch,
         step,
         lr,
-        window_loss,
-        window_accuracy * 100.0,
-        cumulative_loss_avg,
-        cumulative_accuracy * 100.0,
-        int(interval_tokens),
-        int(cumulative_tokens),
+        loss,
+        accuracy * 100.0,
+        int(tokens),
     )
 
     metrics = {
-        "train/loss": float(cumulative_loss_avg),
-        "train/accuracy": float(cumulative_accuracy),
-        "train/loss_window": float(window_loss),
-        "train/accuracy_window": float(window_accuracy),
-        "train/tokens_window": float(interval_tokens),
-        "train/tokens_total": float(cumulative_tokens),
+        "train/loss": float(loss),
+        "train/accuracy": float(accuracy),
+        "train/tokens": float(tokens),
         "train/lr": float(lr),
         "train/epoch": float(epoch),
     }
-    if moving_avg_loss is not None:
-        suffix = f"{moving_avg_window}" if moving_avg_window else ""
-        metrics[f"train/loss_ma{suffix}"] = float(moving_avg_loss)
-    if moving_avg_accuracy is not None:
-        suffix = f"{moving_avg_window}" if moving_avg_window else ""
-        metrics[f"train/accuracy_ma{suffix}"] = float(moving_avg_accuracy)
     if wandb_module:
         wandb_module.log(metrics, step=step)
     return metrics
@@ -841,28 +1011,53 @@ def main(cfg: DictConfig) -> None:
         shuffle=bool(cfg.data.shuffle),
     )
 
+    eval_batch_size = int(cfg.eval.batch_size)
     eval_split_cfg = cfg.dataset.get("eval_splits", None)
     if eval_split_cfg is None and cfg.dataset.get("eval_split", None):
         eval_split_cfg = cfg.dataset.eval_split
     eval_split_names = normalize_split_config(eval_split_cfg)
     eval_loaders: Dict[str, DataLoader] = {}
-    if eval_split_names:
-        eval_batch_size = int(cfg.eval.batch_size)
-        for split_name in eval_split_names:
+    for split_name in eval_split_names:
+        eval_dataset = instantiate_episode_dataset(
+            cfg,
+            split_name,
+            seed=seed,
+            augmentation=None,
+        )
+        eval_loaders[split_name] = make_episode_dataloader(
+            dataset=eval_dataset,
+            tokens=tokens,
+            cfg=cfg,
+            batch_size=eval_batch_size,
+            ignore_index=ignore_index,
+            shuffle=False,
+        )
+
+    train_eval_split_cfg = cfg.dataset.get("train_eval_splits", None)
+    train_eval_split_names = normalize_split_config(train_eval_split_cfg)
+    for split_name in train_eval_split_names:
+        if split_name in eval_loaders:
+            continue
+        try:
             eval_dataset = instantiate_episode_dataset(
                 cfg,
                 split_name,
                 seed=seed,
                 augmentation=None,
             )
-            eval_loaders[split_name] = make_episode_dataloader(
-                dataset=eval_dataset,
-                tokens=tokens,
-                cfg=cfg,
-                batch_size=eval_batch_size,
-                ignore_index=ignore_index,
-                shuffle=False,
+        except Exception as exc:  # pragma: no cover - dataset availability depends on external data
+            LOGGER.warning(
+                "Skipping train evaluation split '%s' due to error: %s", split_name, exc
             )
+            continue
+        eval_loaders[split_name] = make_episode_dataloader(
+            dataset=eval_dataset,
+            tokens=tokens,
+            cfg=cfg,
+            batch_size=eval_batch_size,
+            ignore_index=ignore_index,
+            shuffle=False,
+        )
 
     test_cfg = cfg.get("test", None)
     test_split_cfg = cfg.dataset.get("test_splits", None)
@@ -894,8 +1089,34 @@ def main(cfg: DictConfig) -> None:
     model, device = prepare_baseline_model(cfg, tokens)
     model.to(device)
 
+    if wandb_module and wandb_run:
+        num_parameters = sum(param.numel() for param in model.parameters())
+        wandb_run.summary["model/num_parameters"] = int(num_parameters)
+
     if wandb_module and wandb_run and wandb_cfg and wandb_cfg.get("log_model", False):
         wandb_module.watch(model, log="all", log_freq=max(1, int(cfg.trainer.log_every)))
+
+    checkpoint_manager: Optional[CheckpointManager] = None
+    checkpoint_cfg = cfg.trainer.get("checkpoints", None)
+    if checkpoint_cfg and bool(checkpoint_cfg.get("enabled", False)):
+        if not isinstance(model, torch.nn.Module):
+            LOGGER.warning(
+                "Checkpoint saving is only supported for neural baselines. Skipping request."
+            )
+        else:
+            checkpoint_dir = resolve_checkpoint_directory(
+                checkpoint_cfg=checkpoint_cfg,
+                wandb_cfg=wandb_cfg,
+                wandb_run=wandb_run,
+            )
+            if checkpoint_dir is not None:
+                checkpoint_manager = CheckpointManager(checkpoint_dir)
+                LOGGER.info(
+                    "Checkpointing enabled; artifacts will be saved under %s",
+                    checkpoint_dir,
+                )
+            else:
+                LOGGER.warning("Checkpointing disabled because the directory could not be prepared.")
 
     optimizer_name = str(cfg.optimizer.name).lower()
     if optimizer_name != "adamw":  # pragma: no cover - config validation
@@ -968,13 +1189,8 @@ def main(cfg: DictConfig) -> None:
     global_step = 0
     current_epoch = 0
     should_stop = False
-    interval_loss = 0.0
-    interval_correct = 0
-    interval_tokens = 0
-    cumulative_loss = 0.0
-    cumulative_correct = 0
-    cumulative_tokens = 0
-    moving_window: Deque[Tuple[float, int, int]] = deque(maxlen=log_every)
+    last_step_stats: Optional[Dict[str, Any]] = None
+    last_logged_step = -1
 
     while not should_stop:
         current_epoch += 1
@@ -1025,39 +1241,27 @@ def main(cfg: DictConfig) -> None:
 
                 global_step += 1
 
-                interval_loss += step_loss
-                interval_correct += step_correct
-                interval_tokens += step_tokens
-                cumulative_loss += step_loss
-                cumulative_correct += step_correct
-                cumulative_tokens += step_tokens
-                if step_tokens > 0:
-                    moving_window.append((step_loss, step_correct, step_tokens))
+                current_lr = optimizer.param_groups[0]["lr"]
+                last_step_stats = {
+                    "epoch": current_epoch,
+                    "step": global_step,
+                    "lr": float(current_lr),
+                    "loss_sum": float(step_loss),
+                    "correct": int(step_correct),
+                    "tokens": int(step_tokens),
+                }
 
-                if interval_tokens > 0 and global_step % log_every == 0:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    moving_stats = compute_moving_average(moving_window)
-                    moving_loss = moving_accuracy = None
-                    if moving_stats is not None:
-                        moving_loss, moving_accuracy = moving_stats
+                if step_tokens > 0 and global_step % log_every == 0:
                     last_train_metrics = log_training_metrics(
                         epoch=current_epoch,
                         step=global_step,
-                        lr=current_lr,
-                        interval_loss=interval_loss,
-                        interval_correct=interval_correct,
-                        interval_tokens=int(interval_tokens),
-                        cumulative_loss=cumulative_loss,
-                        cumulative_correct=cumulative_correct,
-                        cumulative_tokens=int(cumulative_tokens),
+                        lr=float(current_lr),
+                        loss_sum=float(step_loss),
+                        correct=int(step_correct),
+                        tokens=int(step_tokens),
                         wandb_module=wandb_module,
-                        moving_avg_loss=moving_loss,
-                        moving_avg_accuracy=moving_accuracy,
-                        moving_avg_window=moving_window.maxlen,
                     )
-                    interval_loss = 0.0
-                    interval_correct = 0
-                    interval_tokens = 0
+                    last_logged_step = global_step
 
                 if (
                     eval_loaders
@@ -1076,13 +1280,21 @@ def main(cfg: DictConfig) -> None:
                     latest_eval_metrics = aggregated_metrics
                     latest_eval_by_split = metrics_by_split
                     log_split_metrics(
-                        tag="eval",
+                        tag="val",
                         metrics_by_split=metrics_by_split,
                         aggregated_metrics=aggregated_metrics,
                         step=global_step,
                         epoch=None,
                         wandb_module=wandb_module,
                     )
+                    if checkpoint_manager:
+                        checkpoint_manager.record_evaluation(
+                            model=model,
+                            aggregated_metrics=aggregated_metrics,
+                            metrics_by_split=metrics_by_split,
+                            epoch=None,
+                            step=global_step,
+                        )
 
                 optimizer.zero_grad(set_to_none=True)
                 step_loss = 0.0
@@ -1101,70 +1313,66 @@ def main(cfg: DictConfig) -> None:
                 scheduler.step()
             global_step += 1
 
-            interval_loss += step_loss
-            interval_correct += step_correct
-            interval_tokens += step_tokens
-            cumulative_loss += step_loss
-            cumulative_correct += step_correct
-            cumulative_tokens += step_tokens
-            if step_tokens > 0:
-                moving_window.append((step_loss, step_correct, step_tokens))
+            current_lr = optimizer.param_groups[0]["lr"]
+            last_step_stats = {
+                "epoch": current_epoch,
+                "step": global_step,
+                "lr": float(current_lr),
+                "loss_sum": float(step_loss),
+                "correct": int(step_correct),
+                "tokens": int(step_tokens),
+            }
 
-            if interval_tokens > 0 and global_step % log_every == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                moving_stats = compute_moving_average(moving_window)
-                moving_loss = moving_accuracy = None
-                if moving_stats is not None:
-                    moving_loss, moving_accuracy = moving_stats
+            if step_tokens > 0 and global_step % log_every == 0:
                 last_train_metrics = log_training_metrics(
                     epoch=current_epoch,
                     step=global_step,
-                    lr=current_lr,
-                    interval_loss=interval_loss,
-                    interval_correct=interval_correct,
-                    interval_tokens=int(interval_tokens),
-                    cumulative_loss=cumulative_loss,
-                    cumulative_correct=cumulative_correct,
-                    cumulative_tokens=int(cumulative_tokens),
+                    lr=float(current_lr),
+                    loss_sum=float(step_loss),
+                    correct=int(step_correct),
+                    tokens=int(step_tokens),
                     wandb_module=wandb_module,
-                    moving_avg_loss=moving_loss,
-                    moving_avg_accuracy=moving_accuracy,
-                    moving_avg_window=moving_window.maxlen,
                 )
-                interval_loss = 0.0
-                interval_correct = 0
-                interval_tokens = 0
+                last_logged_step = global_step
 
-            if (
-                eval_loaders
-                and not use_epoch_training
-                and eval_every
-                and global_step % eval_every == 0
-            ):
-                metrics_by_split = evaluate_splits(
-                    model,
-                    eval_loaders,
-                    device=device,
-                    ignore_index=ignore_index,
-                    max_episodes=max_eval_episodes,
-                )
-                aggregated_metrics = aggregate_split_metrics(metrics_by_split)
-                latest_eval_metrics = aggregated_metrics
-                latest_eval_by_split = metrics_by_split
-                log_split_metrics(
-                    tag="eval",
-                    metrics_by_split=metrics_by_split,
+        if (
+            eval_loaders
+            and not use_epoch_training
+            and eval_every
+            and global_step % eval_every == 0
+        ):
+            metrics_by_split = evaluate_splits(
+                model,
+                eval_loaders,
+                device=device,
+                ignore_index=ignore_index,
+                max_episodes=max_eval_episodes,
+            )
+            aggregated_metrics = aggregate_split_metrics(metrics_by_split)
+            latest_eval_metrics = aggregated_metrics
+            latest_eval_by_split = metrics_by_split
+            log_split_metrics(
+                tag="val",
+                metrics_by_split=metrics_by_split,
+                aggregated_metrics=aggregated_metrics,
+                step=global_step,
+                epoch=None,
+                wandb_module=wandb_module,
+            )
+            if checkpoint_manager:
+                checkpoint_manager.record_evaluation(
+                    model=model,
                     aggregated_metrics=aggregated_metrics,
-                    step=global_step,
+                    metrics_by_split=metrics_by_split,
                     epoch=None,
-                    wandb_module=wandb_module,
+                    step=global_step,
                 )
 
-            optimizer.zero_grad(set_to_none=True)
-            step_loss = 0.0
-            step_correct = 0
-            step_tokens = 0
-            micro_batches = 0
+        optimizer.zero_grad(set_to_none=True)
+        step_loss = 0.0
+        step_correct = 0
+        step_tokens = 0
+        micro_batches = 0
 
         if max_steps is not None and global_step >= max_steps:
             should_stop = True
@@ -1186,13 +1394,21 @@ def main(cfg: DictConfig) -> None:
             latest_eval_metrics = aggregated_metrics
             latest_eval_by_split = metrics_by_split
             log_split_metrics(
-                tag="eval",
+                tag="val",
                 metrics_by_split=metrics_by_split,
                 aggregated_metrics=aggregated_metrics,
                 step=global_step,
                 epoch=current_epoch,
                 wandb_module=wandb_module,
             )
+            if checkpoint_manager:
+                checkpoint_manager.record_evaluation(
+                    model=model,
+                    aggregated_metrics=aggregated_metrics,
+                    metrics_by_split=metrics_by_split,
+                    epoch=current_epoch,
+                    step=global_step,
+                )
 
         if use_epoch_training and num_epochs is not None and current_epoch >= num_epochs:
             should_stop = True
@@ -1200,33 +1416,30 @@ def main(cfg: DictConfig) -> None:
         if not use_epoch_training and max_steps is not None and global_step >= max_steps:
             should_stop = True
 
+        if checkpoint_manager:
+            checkpoint_manager.save_last(model)
+
         if should_stop:
             break
 
-    if global_step > 0 and interval_tokens > 0:
-        current_lr = optimizer.param_groups[0]["lr"]
-        moving_stats = compute_moving_average(moving_window)
-        moving_loss = moving_accuracy = None
-        if moving_stats is not None:
-            moving_loss, moving_accuracy = moving_stats
+    if checkpoint_manager:
+        checkpoint_manager.save_last(model)
+
+    if (
+        last_step_stats
+        and int(last_step_stats["tokens"]) > 0
+        and int(last_step_stats["step"]) != last_logged_step
+    ):
         last_train_metrics = log_training_metrics(
-            epoch=current_epoch,
-            step=global_step,
-            lr=current_lr,
-            interval_loss=interval_loss,
-            interval_correct=interval_correct,
-            interval_tokens=int(interval_tokens),
-            cumulative_loss=cumulative_loss,
-            cumulative_correct=cumulative_correct,
-            cumulative_tokens=int(cumulative_tokens),
+            epoch=int(last_step_stats["epoch"]),
+            step=int(last_step_stats["step"]),
+            lr=float(last_step_stats["lr"]),
+            loss_sum=float(last_step_stats["loss_sum"]),
+            correct=int(last_step_stats["correct"]),
+            tokens=int(last_step_stats["tokens"]),
             wandb_module=wandb_module,
-            moving_avg_loss=moving_loss,
-            moving_avg_accuracy=moving_accuracy,
-            moving_avg_window=moving_window.maxlen,
         )
-        interval_loss = 0.0
-        interval_correct = 0
-        interval_tokens = 0
+        last_logged_step = int(last_step_stats["step"])
 
     LOGGER.info("Training complete. Ran for %d optimisation steps.", global_step)
 
@@ -1250,17 +1463,24 @@ def main(cfg: DictConfig) -> None:
             wandb_module=wandb_module,
         )
 
+    if checkpoint_manager:
+        checkpoint_manager.finalize(
+            total_steps=global_step,
+            test_metrics_by_split=test_metrics_by_split,
+            test_aggregated_metrics=test_aggregated_metrics,
+        )
+
     if wandb_run:
         wandb_run.summary["train/steps"] = global_step
         if last_train_metrics:
             for key, value in last_train_metrics.items():
                 wandb_run.summary[key] = value
         if latest_eval_metrics:
-            wandb_run.summary["eval/loss_mean"] = latest_eval_metrics.get("loss")
-            wandb_run.summary["eval/accuracy_mean"] = latest_eval_metrics.get("accuracy")
+            wandb_run.summary["val/loss_mean"] = latest_eval_metrics.get("loss")
+            wandb_run.summary["val/accuracy_mean"] = latest_eval_metrics.get("accuracy")
         for split_name, metrics in latest_eval_by_split.items():
-            wandb_run.summary[f"eval/{split_name}/loss"] = metrics.get("loss")
-            wandb_run.summary[f"eval/{split_name}/accuracy"] = metrics.get("accuracy")
+            wandb_run.summary[f"val/{split_name}/loss"] = metrics.get("loss")
+            wandb_run.summary[f"val/{split_name}/accuracy"] = metrics.get("accuracy")
         if test_aggregated_metrics:
             wandb_run.summary["test/loss_mean"] = test_aggregated_metrics.get("loss")
             wandb_run.summary["test/accuracy_mean"] = test_aggregated_metrics.get(

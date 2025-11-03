@@ -17,8 +17,8 @@ ARCHES=(
 for arch in "${ARCHES[@]}"; do
   echo "=== Training '${arch}' (small) ==="
   python "$(dirname "${BASH_SOURCE[0]}")/train.py" \
-    --config-name train/default \
+    --config-name train/single_epoch \
     model.architecture="${arch}" \
     logging.wandb.enabled=true \
-    logging.wandb.project=ca_
+    logging.wandb.project=ca_tmp_new
 done
