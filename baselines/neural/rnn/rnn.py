@@ -21,8 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import tape_rnn
-
 
 class RNNModel(nn.Module):
     """PyTorch RNN model wrapper."""
@@ -72,11 +70,11 @@ class RNNModel(nn.Module):
                       self.input_window * embed_size)
 
         # Forward pass through RNN
-        if hasattr(self.rnn_core, 'initial_state') and hasattr(tape_rnn, 'TapeRNNCore'):
-            # Handle custom RNN cores (like TapeRNN, NDStackRNN) that need timestep-by-timestep processing
-            if isinstance(self.rnn_core, tape_rnn.TapeRNNCore):
+        if hasattr(self.rnn_core, "initial_state"):
+            # Handle custom RNN cores that need timestep-by-timestep processing
+            try:
                 initial_state = self.rnn_core.initial_state(batch_size, input_length)
-            else:
+            except TypeError:
                 initial_state = self.rnn_core.initial_state(batch_size)
             
             # Manual unroll over time dimension (similar to hk.dynamic_unroll)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -11,6 +12,10 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Ensure repository modules stay importable even when Hydra changes the working dir.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 LOG = logging.getLogger(__name__)
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -15,8 +15,7 @@ from .neural.recursive_reasoning import (
 )
 from .neural.nca.nca1d import NCA1DSeq2Seq
 from .neural.rnn.rnn import RNNModel
-from .neural.rnn.stack_rnn import StackRNNCore
-from .neural.rnn.tape_rnn import TapeInputLengthJumpCore
+
 from .neural.transformer import make_transformer
 
 
@@ -48,6 +47,7 @@ class RNNSeq2Seq(nn.Module):
         super().__init__()
         self.input_vocab_size = config.input_vocab_size
         self.output_vocab_size = config.output_vocab_size
+
         self.model = RNNModel(
             output_size=config.output_vocab_size,
             rnn_core="lstm",
@@ -83,6 +83,7 @@ class TransformerSeq2Seq(nn.Module):
         super().__init__()
         self.input_vocab_size = config.input_vocab_size
         self.output_vocab_size = config.output_vocab_size
+
         embedding_dim = int(model_kwargs.pop("embedding_dim", 128))
         num_layers = int(model_kwargs.pop("num_layers", 2))
         num_heads = int(model_kwargs.pop("num_heads", 4))
@@ -344,120 +345,6 @@ class TransformerACTSeq2Seq(nn.Module):
         return outputs["logits"]
 
 
-class TapeRNNSeq2Seq(nn.Module):
-    """Sequence-to-sequence wrapper for the differentiable tape RNN core."""
-
-    def __init__(
-        self,
-        config: BaselineConfig,
-        **model_kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.input_vocab_size = config.input_vocab_size
-        self.output_vocab_size = config.output_vocab_size
-
-        core_kwargs = dict(model_kwargs)
-        memory_cell_size = int(core_kwargs.pop("memory_cell_size", 128))
-        memory_size = int(core_kwargs.pop("memory_size", 32))
-        n_tapes = int(core_kwargs.pop("n_tapes", 1))
-        mlp_layers_size = core_kwargs.pop("mlp_layers_size", (64, 64))
-        if mlp_layers_size is None:
-            mlp_layers = ()
-        elif isinstance(mlp_layers_size, Sequence) and not isinstance(mlp_layers_size, (str, bytes)):
-            mlp_layers = tuple(int(layer) for layer in mlp_layers_size)
-        else:
-            mlp_layers = (int(mlp_layers_size),)
-        inner_core = str(core_kwargs.pop("inner_core", "lstm"))
-        hidden_size = int(core_kwargs.pop("hidden_size", 256))
-        input_size = int(core_kwargs.pop("input_size", config.input_vocab_size))
-        input_window = int(core_kwargs.pop("input_window", 1))
-
-        tape_core = TapeInputLengthJumpCore(
-            memory_cell_size=memory_cell_size,
-            memory_size=memory_size,
-            n_tapes=n_tapes,
-            mlp_layers_size=mlp_layers,
-            inner_core=inner_core,
-            hidden_size=hidden_size,
-            input_size=input_size,
-            **core_kwargs,
-        )
-        self.model = RNNModel(
-            output_size=config.output_vocab_size,
-            rnn_core=tape_core,
-            return_all_outputs=True,
-            input_window=input_window,
-            input_size=input_size,
-            hidden_size=hidden_size,
-        )
-        self.requires_targets = False
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        del targets  # unused
-        one_hot = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
-        logits = self.model(one_hot, input_length=inputs.size(1))
-        if logits.ndim == 2:
-            logits = logits.unsqueeze(1)
-        return logits
-
-
-class StackRNNSeq2Seq(nn.Module):
-    """Sequence-to-sequence wrapper for the differentiable stack RNN core."""
-
-    def __init__(
-        self,
-        config: BaselineConfig,
-        **model_kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.input_vocab_size = config.input_vocab_size
-        self.output_vocab_size = config.output_vocab_size
-
-        core_kwargs = dict(model_kwargs)
-        stack_cell_size = int(core_kwargs.pop("stack_cell_size", 128))
-        stack_size = int(core_kwargs.pop("stack_size", 32))
-        n_stacks = int(core_kwargs.pop("n_stacks", 1))
-        inner_core = str(core_kwargs.pop("inner_core", "lstm"))
-        hidden_size = int(core_kwargs.pop("hidden_size", 256))
-        input_size = int(core_kwargs.pop("input_size", config.input_vocab_size))
-        input_window = int(core_kwargs.pop("input_window", 1))
-
-        stack_core = StackRNNCore(
-            stack_cell_size=stack_cell_size,
-            stack_size=stack_size,
-            n_stacks=n_stacks,
-            inner_core=inner_core,
-            hidden_size=hidden_size,
-            input_size=input_size,
-            **core_kwargs,
-        )
-        self.model = RNNModel(
-            output_size=config.output_vocab_size,
-            rnn_core=stack_core,
-            return_all_outputs=True,
-            input_window=input_window,
-            input_size=input_size,
-            hidden_size=hidden_size,
-        )
-        self.requires_targets = False
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        del targets  # unused
-        one_hot = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
-        logits = self.model(one_hot, input_length=inputs.size(1))
-        if logits.ndim == 2:
-            logits = logits.unsqueeze(1)
-        return logits
-
-
 def _build_rnn(config: BaselineConfig) -> nn.Module:
     return RNNSeq2Seq(config, **dict(config.model_kwargs)).to(config.device, dtype=config.dtype)
 
@@ -489,16 +376,6 @@ def _build_transformer_act(config: BaselineConfig) -> nn.Module:
     return model.to(config.device, dtype=config.dtype)
 
 
-def _build_tape_rnn(config: BaselineConfig) -> nn.Module:
-    model = TapeRNNSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(config.device, dtype=config.dtype)
-
-
-def _build_stack_rnn(config: BaselineConfig) -> nn.Module:
-    model = StackRNNSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(config.device, dtype=config.dtype)
-
-
 def _build_nca1d(config: BaselineConfig) -> nn.Module:
     model = NCA1DSeq2Seq(config, **dict(config.model_kwargs))
     return model.to(config.device, dtype=config.dtype)
@@ -512,8 +389,6 @@ BASELINE_REGISTRY: Dict[str, Callable[[BaselineConfig], nn.Module]] = {
     "trm": _build_tiny_recursive,
     "hrm": _build_hierarchical_recursive,
     "transformer_act": _build_transformer_act,
-    "tape_rnn": _build_tape_rnn,
-    "stack_rnn": _build_stack_rnn,
     "nca1d": _build_nca1d,
 }
 
@@ -539,8 +414,6 @@ __all__ = [
     "TinyRecursiveSeq2Seq",
     "HierarchicalReasoningSeq2Seq",
     "TransformerACTSeq2Seq",
-    "TapeRNNSeq2Seq",
-    "StackRNNSeq2Seq",
     "TransformerSeq2Seq",
     "NCA1DSeq2Seq",
     "create_baseline",
