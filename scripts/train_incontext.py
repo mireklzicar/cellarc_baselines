@@ -706,6 +706,9 @@ def evaluate(
     device: torch.device,
     ignore_index: int,
     max_episodes: Optional[int],
+    tokens: TokenVocabulary,
+    seed: int,
+    tta_cfg: Optional[Dict[str, Any]],
 ) -> Dict[str, float]:
     """Run evaluation over the provided dataloader."""
 
@@ -715,24 +718,152 @@ def evaluate(
     total_correct = 0
     total_episodes = 0
 
-    with torch.no_grad():
-        for batch in loader:
-            batch = {
-                key: value.to(device)
-                for key, value in batch.items()
-            }
-            logits = forward_batch(model, batch)
-            stats = compute_batch_loss(
-                logits,
-                labels=batch["labels"],
-                ignore_index=ignore_index,
-            )
+    tta_settings = dict(tta_cfg or {})
+    tta_enabled = bool(tta_settings.get("enabled", False))
+    num_augs = max(0, int(tta_settings.get("num_augs", 0)))
+    vote_mode = str(tta_settings.get("vote", "mean_logits")).lower()
+    apply_to_mode = str(tta_settings.get("apply_to", "query_only")).lower()
+    palette_enabled = bool(tta_settings.get("use_palette", False))
+    reverse_enabled = bool(tta_settings.get("use_reverse", False))
 
-            valid_tokens = int(stats["total"].item())
-            if valid_tokens > 0:
-                total_loss += float(stats["loss"].item()) * valid_tokens
-                total_tokens += valid_tokens
-                total_correct += int(stats["correct"].item())
+    if vote_mode not in {"mean_logits", "majority"}:
+        raise ValueError(f"Unsupported TTA vote mode '{vote_mode}'. Expected 'mean_logits' or 'majority'.")
+    if apply_to_mode not in {"query_only", "both"}:
+        raise ValueError(f"Unsupported TTA apply_to='{apply_to_mode}'. Expected 'query_only' or 'both'.")
+
+    with torch.no_grad():
+        for batch_index, batch in enumerate(loader):
+            batch = {key: value.to(device) for key, value in batch.items()}
+            labels = batch["labels"]
+            valid_mask = labels != ignore_index
+            loss_mask = batch.get("loss_mask")
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(device=device, dtype=torch.bool)
+
+            if not tta_enabled:
+                logits = forward_batch(model, batch)
+                stats = compute_batch_loss(
+                    logits,
+                    labels=labels,
+                    ignore_index=ignore_index,
+                )
+
+                valid_tokens = int(stats["total"].item())
+                if valid_tokens > 0:
+                    total_loss += float(stats["loss"].item()) * valid_tokens
+                    total_tokens += valid_tokens
+                    total_correct += int(stats["correct"].item())
+            else:
+                base_logits = forward_batch(model, batch)
+                logits_sum = base_logits.clone()
+                preds_views: List[torch.Tensor] = [base_logits.argmax(dim=-1)]
+                num_views = 1
+
+                aggregate_mask = valid_mask.clone()
+                if apply_to_mode == "query_only" and loss_mask is not None:
+                    aggregate_mask = aggregate_mask & loss_mask
+
+                # Ensure aggregation covers only valid positions.
+                aggregate_mask = aggregate_mask & valid_mask
+
+                episode_start = total_episodes
+                for aug_idx in range(num_augs):
+                    rng_seed = seed + episode_start + aug_idx + batch_index
+                    rng = random.Random(rng_seed)
+                    perm = list(range(tokens.num_colors))
+                    if palette_enabled and tokens.num_colors > 0:
+                        perm = sample_palette_perm(rng, tokens.num_colors)
+                    inv_perm = invert_perm(perm)
+
+                    inputs_aug = batch["inputs"].clone()
+                    targets_aug = batch["targets"].clone()
+                    if palette_enabled and tokens.num_colors > 0:
+                        inputs_aug = apply_palette(inputs_aug, perm, tokens.num_colors)
+                        targets_aug = apply_palette(targets_aug, perm, tokens.num_colors)
+                    if reverse_enabled:
+                        inputs_aug = reverse_value_segments(inputs_aug, tokens)
+                        targets_aug = reverse_value_segments(targets_aug, tokens)
+
+                    aug_batch = dict(batch)
+                    aug_batch["inputs"] = inputs_aug
+                    aug_batch["targets"] = targets_aug
+                    logits_aug = forward_batch(model, aug_batch)
+
+                    if palette_enabled and tokens.num_colors > 0:
+                        logits_aug = logits_aug.clone()
+                        inv_indices = torch.tensor(
+                            inv_perm,
+                            dtype=torch.long,
+                            device=logits_aug.device,
+                        )
+                        color_logits = logits_aug[..., : tokens.num_colors]
+                        logits_aug[..., : tokens.num_colors] = color_logits.index_select(
+                            -1, inv_indices
+                        )
+                    preds_aug = logits_aug.argmax(dim=-1)
+
+                    if palette_enabled and tokens.num_colors > 0:
+                        vocab_size = logits_aug.size(-1)
+                        mapping = torch.arange(
+                            vocab_size, device=logits_aug.device, dtype=torch.long
+                        )
+                        mapping[: tokens.num_colors] = torch.tensor(
+                            inv_perm, device=logits_aug.device, dtype=torch.long
+                        )
+                        preds_aug = mapping[preds_aug]
+
+                    logits_sum += logits_aug
+                    num_views += 1
+                    preds_views.append(preds_aug)
+
+                mean_logits_all = logits_sum / float(num_views)
+                mask_3d = aggregate_mask.unsqueeze(-1)
+                final_logits = torch.where(mask_3d, mean_logits_all, base_logits)
+
+                if aggregate_mask.any() and num_views > 1 and vote_mode == "majority":
+                    stacked_preds = torch.stack(preds_views, dim=0)
+                    stacked_preds_flat = stacked_preds.view(num_views, -1)
+                    mask_flat = aggregate_mask.view(-1)
+                    votes = stacked_preds_flat[:, mask_flat]
+                    vocab_size = final_logits.size(-1)
+                    if votes.numel() > 0:
+                        vote_counts = torch.nn.functional.one_hot(
+                            votes, num_classes=vocab_size
+                        ).sum(dim=0)
+                        winners = vote_counts.argmax(dim=-1)
+                        max_counts = vote_counts.max(dim=-1, keepdim=True).values
+                        tie_mask = (vote_counts == max_counts).sum(dim=-1) > 1
+                        if tie_mask.any():
+                            logits_flat = mean_logits_all.view(-1, vocab_size)[mask_flat]
+                            tie_logits = logits_flat[tie_mask]
+                            tie_choice = tie_logits.argmax(dim=-1)
+                            winners = winners.clone()
+                            winners[tie_mask] = tie_choice
+                        final_preds_flat = preds_views[0].view(-1).clone()
+                        final_preds_flat[mask_flat] = winners.to(final_preds_flat.dtype)
+                        final_predictions = final_preds_flat.view_as(preds_views[0])
+                    else:
+                        final_predictions = preds_views[0]
+                else:
+                    aggregated_preds = mean_logits_all.argmax(dim=-1)
+                    final_predictions = torch.where(
+                        aggregate_mask, aggregated_preds, preds_views[0]
+                    )
+
+                vocab_size = final_logits.size(-1)
+                per_token_loss = torch.nn.functional.cross_entropy(
+                    final_logits.reshape(-1, vocab_size),
+                    labels.view(-1),
+                    ignore_index=ignore_index,
+                    reduction="none",
+                ).view_as(labels)
+                effective_loss = per_token_loss * valid_mask.float()
+                total_loss += float(effective_loss.sum().item())
+                valid_tokens = int(valid_mask.long().sum().item())
+                if valid_tokens > 0:
+                    total_tokens += valid_tokens
+                    correct = (final_predictions == labels) & valid_mask
+                    total_correct += int(correct.long().sum().item())
 
             total_episodes += batch["inputs"].size(0)
             if max_episodes is not None and total_episodes >= max_episodes:
@@ -854,6 +985,9 @@ def evaluate_splits(
     device: torch.device,
     ignore_index: int,
     max_episodes: Optional[int],
+    tokens: TokenVocabulary,
+    seed: int,
+    tta_cfg: Optional[Dict[str, Any]],
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate the model over multiple splits and return metrics per split."""
 
@@ -864,6 +998,9 @@ def evaluate_splits(
             device=device,
             ignore_index=ignore_index,
             max_episodes=max_episodes,
+            tokens=tokens,
+            seed=seed,
+            tta_cfg=tta_cfg,
         )
         for split_name, loader in loaders.items()
     }
@@ -1010,6 +1147,76 @@ def resolve_augmentation_settings(
     }
 
 
+def sample_palette_perm(rng: random.Random, num_colors: int) -> List[int]:
+    """Return a random permutation over colour token ids."""
+
+    perm = list(range(num_colors))
+    rng.shuffle(perm)
+    return perm
+
+
+def invert_perm(perm: List[int]) -> List[int]:
+    """Compute the inverse permutation."""
+
+    inv = [0] * len(perm)
+    for index, value in enumerate(perm):
+        inv[value] = index
+    return inv
+
+
+def apply_palette(
+    x: torch.Tensor,
+    perm: Sequence[int],
+    num_colors: int,
+) -> torch.Tensor:
+    """Apply a palette permutation to colour tokens."""
+
+    if num_colors <= 0:
+        return x
+    out = x.clone()
+    lut = torch.tensor(perm, dtype=out.dtype, device=out.device)
+    mask = out < num_colors
+    if mask.any():
+        out[mask] = lut[out[mask]]
+    return out
+
+
+def reverse_value_segments(
+    x: torch.Tensor,
+    tokens: TokenVocabulary,
+) -> torch.Tensor:
+    """Reverse contiguous runs of value tokens between marker tokens."""
+
+    out = x.clone()
+    markers = {
+        tokens.support_input_id,
+        tokens.support_output_id,
+        tokens.query_id,
+        tokens.target_id,
+        tokens.eos_id,
+    }
+    batch_size, seq_len = out.shape
+    for b_idx in range(batch_size):
+        pos = 0
+        while pos < seq_len:
+            current = int(out[b_idx, pos].item())
+            if current in markers:
+                end = pos + 1
+                while (
+                    end < seq_len
+                    and int(out[b_idx, end].item()) not in markers
+                    and int(out[b_idx, end].item()) != tokens.pad_id
+                ):
+                    end += 1
+                if end > pos + 1:
+                    span = out[b_idx, pos + 1 : end]
+                    out[b_idx, pos + 1 : end] = torch.flip(span, dims=[0])
+                pos = end
+            else:
+                pos += 1
+    return out
+
+
 def run(cfg: DictConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     LOGGER.info("Working directory: %s", os.getcwd())
@@ -1054,6 +1261,7 @@ def run(cfg: DictConfig) -> None:
     )
 
     eval_batch_size = int(cfg.eval.batch_size)
+    tta_cfg = cfg.eval.get("tta", None)
     eval_split_cfg = cfg.dataset.get("eval_splits", None)
     if eval_split_cfg is None and cfg.dataset.get("eval_split", None):
         eval_split_cfg = cfg.dataset.eval_split
@@ -1344,6 +1552,9 @@ def run(cfg: DictConfig) -> None:
                         device=device,
                         ignore_index=ignore_index,
                         max_episodes=max_eval_episodes,
+                        tokens=tokens,
+                        seed=seed,
+                        tta_cfg=tta_cfg,
                     )
                     aggregated_metrics = aggregate_split_metrics(metrics_by_split)
                     latest_eval_metrics = aggregated_metrics
@@ -1416,6 +1627,9 @@ def run(cfg: DictConfig) -> None:
                 device=device,
                 ignore_index=ignore_index,
                 max_episodes=max_eval_episodes,
+                tokens=tokens,
+                seed=seed,
+                tta_cfg=tta_cfg,
             )
             aggregated_metrics = aggregate_split_metrics(metrics_by_split)
             latest_eval_metrics = aggregated_metrics
@@ -1458,6 +1672,9 @@ def run(cfg: DictConfig) -> None:
                 device=device,
                 ignore_index=ignore_index,
                 max_episodes=max_eval_episodes,
+                tokens=tokens,
+                seed=seed,
+                tta_cfg=tta_cfg,
             )
             aggregated_metrics = aggregate_split_metrics(metrics_by_split)
             latest_eval_metrics = aggregated_metrics
@@ -1521,6 +1738,9 @@ def run(cfg: DictConfig) -> None:
             device=device,
             ignore_index=ignore_index,
             max_episodes=test_limit,
+            tokens=tokens,
+            seed=seed,
+            tta_cfg=tta_cfg,
         )
         test_aggregated_metrics = aggregate_split_metrics(test_metrics_by_split)
         log_split_metrics(
