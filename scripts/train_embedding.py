@@ -490,6 +490,7 @@ def make_training_dataloader(
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
+        drop_last=True,
     )
 
 

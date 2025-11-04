@@ -392,26 +392,44 @@ def resolve_checkpoint_directory(
         subdir = Path(_sanitize_path_component(timestamp))
 
     checkpoint_dir = base_outputs / subdir
-    if checkpoint_dir.exists() and not bool(checkpoint_cfg.get("overwrite", False)):
-        prompt = f"Checkpoint directory '{checkpoint_dir}' already exists. Overwrite? [y/N]: "
-        try:
-            response = input(prompt)
-        except EOFError:
-            LOGGER.warning(
-                "No interactive input available to confirm overwrite of %s. "
-                "Disabling checkpoint saving.",
-                checkpoint_dir,
-            )
-            return None
-        if response.strip().lower() not in {"y", "yes"}:
-            LOGGER.info(
-                "User declined to overwrite existing checkpoint directory %s. "
-                "Checkpoints will not be saved.",
-                checkpoint_dir,
-            )
-            return None
+    overwrite = bool(checkpoint_cfg.get("overwrite", False))
+    if checkpoint_dir.exists() and not overwrite:
+        original_dir = checkpoint_dir
+        suffix = 0
+        while checkpoint_dir.exists():
+            checkpoint_dir = original_dir.parent / f"{original_dir.name}_{suffix:03d}"
+            suffix += 1
+        LOGGER.info(
+            "Checkpoint directory %s exists; using %s instead.",
+            original_dir,
+            checkpoint_dir,
+        )
+        if wandb_run is not None:
+            try:
+                wandb_run.log(
+                    {"checkpoint_directory": str(checkpoint_dir)},
+                    step=0,
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "Failed to log checkpoint directory change to wandb: %s",
+                    exc,
+                )
+    elif checkpoint_dir.exists() and overwrite:
+        LOGGER.info(
+            "Overwriting existing checkpoint directory %s due to configuration.",
+            checkpoint_dir,
+        )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if wandb_run is not None:
+        try:
+            wandb_run.summary["checkpoint_directory"] = str(checkpoint_dir)
+        except Exception as exc:
+            LOGGER.debug(
+                "Failed to update wandb summary with checkpoint directory: %s",
+                exc,
+            )
     return checkpoint_dir
 
 
