@@ -3,55 +3,47 @@
 
 set -euo pipefail
 
-SKIP_FIRST_RUN=false
-if [[ "${1:-}" == "--skip-first-run" ]]; then
-  SKIP_FIRST_RUN=true
-  shift
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_PY="${SCRIPT_DIR}/train.py"
 
 ARCHES=(
+  rnn
+  rnn_ar
   transformer
-#  transformer_ar
+  transformer_ar
   transformer_act
   cnn1d
-#  nca1d
+  nca1d
   tiny_recursive
   hrm
-  rnn
-#  rnn_ar
 )
 
 EMBEDDING_ARCHES=(
+  rnn
+  rnn_ar
   transformer
-#  transformer_ar
+  transformer_ar
   transformer_act
   cnn1d
-#  nca1d
+  nca1d
   tiny_recursive
   hrm
-  rnn
-#  rnn_ar
 )
 
 MODES=(
-  embedding
   incontext
+  embedding
 )
 
 supports_embedding() {
   local candidate="$1"
-  for emb_arch in "${EMBEDDING_ARCHES[@]}"; do
+for emb_arch in "${EMBEDDING_ARCHES[@]}"; do
     if [[ "${candidate}" == "${emb_arch}" ]]; then
       return 0
     fi
   done
   return 1
 }
-
-run_idx=0
 
 train_band() {
   local size="$1"
@@ -63,35 +55,27 @@ train_band() {
       continue
     fi
 
-    if [[ "${SKIP_FIRST_RUN}" == "true" && ${run_idx} -eq 0 ]]; then
-      echo "--- Skipping first run ${arch} (${size}) mode=${mode} ---"
-      SKIP_FIRST_RUN=false
-      ((run_idx+=1))
-      continue
-    fi
-
     echo "--- Training '${arch}' (${size}) mode=${mode} ---"
     python "${TRAIN_PY}" \
-      --config-name train/default \
+      --config-name train/smoke \
       model.architecture="${arch}" \
       model/size="${size}" \
       training.mode="${mode}" \
-      trainer.checkpoints.enabled=true \
-      logging.wandb.enabled=true \
-      logging.wandb.project="cellarc100k_50e_${mode}_${size}" \
+      trainer.checkpoints.enabled=false \
+      logging.wandb.enabled=false \
+      logging.wandb.project="cellarc100k_${mode}_baselines_${size}" \
       logging.wandb.group="mode_${mode}" \
       logging.wandb.name="${arch}_${size}_${mode}"
-    ((run_idx+=1))
   done
 }
 
 SIZES=("$@")
 if [[ ${#SIZES[@]} -eq 0 ]]; then
-  SIZES=(medium large small)
+  SIZES=(small medium large)
 fi
 
-for size in "${SIZES[@]}"; do
-  for mode in "${MODES[@]}"; do
+for mode in "${MODES[@]}"; do
+  for size in "${SIZES[@]}"; do
     train_band "${size}" "${mode}"
   done
 done

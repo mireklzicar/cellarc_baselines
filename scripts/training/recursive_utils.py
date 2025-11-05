@@ -44,13 +44,21 @@ class PuzzleEmbeddingOptimizer:
             return
 
         for embedding in self._embeddings:
-            grad = getattr(embedding.local_weights, "grad", None)
+            grad = getattr(embedding, "local_grad", None)
             if grad is None:
                 continue
             if grad.numel() == 0:
                 continue
 
-            puzzle_ids = embedding.local_ids
+            active_rows = getattr(embedding, "active_rows", None)
+            if active_rows is None:
+                active_rows = grad.shape[0]
+            if active_rows == 0:
+                continue
+
+            puzzle_ids = embedding.local_ids[:active_rows]
+            grad = grad[:active_rows]
+
             if puzzle_ids.numel() == 0:
                 continue
 
@@ -64,17 +72,20 @@ class PuzzleEmbeddingOptimizer:
             grad_sum.scatter_add_(0, scatter_index, grad)
 
             weights = embedding.weights
-            updated = weights.index_select(0, unique_ids)
+            unique_ids_long = unique_ids.to(dtype=torch.long)
+            updated = weights.index_select(0, unique_ids_long)
             if self.weight_decay:
                 updated = updated.mul(1.0 - self.lr * self.weight_decay)
             updated.add_(torch.sign(grad_sum), alpha=-self.lr)
-            weights.index_copy_(0, unique_ids, updated)
+            weights.index_copy_(0, unique_ids_long, updated)
+
+            if hasattr(embedding, "clear_local_grad"):
+                embedding.clear_local_grad()
 
     def zero_grad(self) -> None:
         for embedding in self._embeddings:
-            grad = getattr(embedding.local_weights, "grad", None)
-            if grad is not None:
-                grad.zero_()
+            if hasattr(embedding, "clear_local_grad"):
+                embedding.clear_local_grad()
 
     def __bool__(self) -> bool:  # pragma: no cover - convenience
         return bool(self._embeddings)

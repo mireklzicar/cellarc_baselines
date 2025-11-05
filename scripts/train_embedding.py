@@ -48,6 +48,15 @@ from scripts.training.recursive_utils import EMAHelper, PuzzleEmbeddingOptimizer
 
 LOGGER = logging.getLogger(__name__)
 RECURSIVE_ARCHITECTURES = {"tiny_recursive", "trm", "hrm", "transformer_act"}
+PUZZLE_EMBED_ARCHITECTURES = {
+    *RECURSIVE_ARCHITECTURES,
+    "transformer",
+    "transformer_ar",
+    "rnn",
+    "rnn_ar",
+    "cnn1d",
+    "nca1d",
+}
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -81,23 +90,28 @@ def forward_embedding_batch(
     model: torch.nn.Module,
     batch: Dict[str, torch.Tensor],
     *,
-    is_recursive: bool,
+    use_puzzle_identifiers: bool,
 ) -> torch.Tensor:
     """Forward pass that optionally provides puzzle identifiers to the model."""
 
     inputs = batch["inputs"]
     targets = batch.get("targets")
-    if is_recursive:
-        puzzle_identifiers = batch["puzzle_identifiers"]
-        return model(
-            inputs,
-            targets=targets,
-            puzzle_identifiers=puzzle_identifiers,
-        )
+    loss_mask = batch.get("loss_mask")
 
-    if getattr(model, "requires_targets", False):
-        return model(inputs, targets=targets)
-    return model(inputs)
+    model_kwargs: Dict[str, torch.Tensor] = {}
+    if targets is not None:
+        model_kwargs["targets"] = targets
+    if loss_mask is not None and getattr(model, "accepts_loss_mask", False):
+        model_kwargs["loss_mask"] = loss_mask
+
+    if use_puzzle_identifiers:
+        puzzle_identifiers = batch["puzzle_identifiers"]
+        model_kwargs["puzzle_identifiers"] = puzzle_identifiers
+
+    if getattr(model, "requires_targets", False) and "targets" not in model_kwargs:
+        raise ValueError("Model requires targets but none were provided.")
+
+    return model(inputs, **model_kwargs)
 
 
 def evaluate_embedding(
@@ -107,6 +121,7 @@ def evaluate_embedding(
     device: torch.device,
     ignore_index: int,
     is_recursive: bool,
+    use_puzzle_identifiers: bool,
     tokens: TokenVocabulary,
     seed: int,
     tta_cfg: Optional[Dict[str, object]] = None,
@@ -155,12 +170,16 @@ def evaluate_embedding(
 
             if not tta_enabled:
                 logits_for_metrics = forward_embedding_batch(
-                    model, batch, is_recursive=is_recursive
+                    model,
+                    batch,
+                    use_puzzle_identifiers=use_puzzle_identifiers,
                 )
                 predictions_for_metrics = logits_for_metrics.argmax(dim=-1)
             else:
                 base_logits = forward_embedding_batch(
-                    model, batch, is_recursive=is_recursive
+                    model,
+                    batch,
+                    use_puzzle_identifiers=use_puzzle_identifiers,
                 )
                 logits_sum = base_logits.clone()
                 preds_views: List[torch.Tensor] = [base_logits.argmax(dim=-1)]
@@ -193,7 +212,9 @@ def evaluate_embedding(
                     aug_batch["inputs"] = inputs_aug
                     aug_batch["targets"] = targets_aug
                     logits_aug = forward_embedding_batch(
-                        model, aug_batch, is_recursive=is_recursive
+                        model,
+                        aug_batch,
+                        use_puzzle_identifiers=use_puzzle_identifiers,
                     )
 
                     if palette_enabled and tokens.num_colors > 0:
@@ -337,6 +358,7 @@ def evaluate_embedding_splits(
     device: torch.device,
     ignore_index: int,
     is_recursive: bool,
+    use_puzzle_identifiers: bool,
     tokens: TokenVocabulary,
     seed: int,
     tta_cfg: Optional[Dict[str, object]],
@@ -351,6 +373,7 @@ def evaluate_embedding_splits(
             device=device,
             ignore_index=ignore_index,
             is_recursive=is_recursive,
+            use_puzzle_identifiers=use_puzzle_identifiers,
             tokens=tokens,
             seed=seed,
             tta_cfg=tta_cfg,
@@ -376,6 +399,50 @@ def scan_puzzle_statistics(
     return total_pairs
 
 
+def compute_puzzle_free_parameter_count(
+    cfg: DictConfig,
+    tokens: TokenVocabulary,
+    *,
+    architecture: str,
+) -> int:
+    """Return the parameter count of the baseline without puzzle embeddings."""
+
+    size_cfg = cfg.model.size
+    model_kwargs: Dict[str, object] = {}
+    if size_cfg and "variants" in size_cfg and architecture in size_cfg.variants:
+        model_kwargs = OmegaConf.to_container(
+            size_cfg.variants[architecture], resolve=True
+        )  # type: ignore[assignment]
+
+    base_model_kwargs = dict(model_kwargs or {})
+    # Disable puzzle-specific modules.
+    base_model_kwargs.pop("num_puzzle_identifiers", None)
+    base_model_kwargs.pop("puzzle_emb_ndim", None)
+    base_model_kwargs["num_puzzle_identifiers"] = 0
+    base_model_kwargs.setdefault("puzzle_emb_ndim", 0)
+
+    dtype_name = str(cfg.model.dtype)
+    dtype = getattr(torch, dtype_name, torch.float32)
+
+    baseline_config = BaselineConfig(
+        input_vocab_size=tokens.vocab_size,
+        output_vocab_size=tokens.vocab_size,
+        max_seq_len=int(cfg.data.max_seq_len),
+        batch_size=int(cfg.data.batch_size),
+        device=torch.device("cpu"),
+        dtype=dtype,
+        model_kwargs=base_model_kwargs,
+        pad_token_id=int(tokens.pad_id),
+    )
+    baseline = create_baseline(architecture, baseline_config)
+    try:
+        return sum(param.numel() for param in baseline.parameters())
+    finally:
+        del baseline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def prepare_embedding_model(
     cfg: DictConfig,
     tokens: TokenVocabulary,
@@ -394,11 +461,11 @@ def prepare_embedding_model(
             f"Unknown architecture '{architecture}'. "
             f"Available baselines: {sorted(registry)}"
         )
-    if architecture not in RECURSIVE_ARCHITECTURES:
+    if architecture not in PUZZLE_EMBED_ARCHITECTURES:
+        supported = ", ".join(sorted(PUZZLE_EMBED_ARCHITECTURES))
         raise ValueError(
-            "Puzzle-embedding training currently supports only recursive reasoning "
-            f"architectures. Received '{architecture}'. Use training.mode=incontext "
-            "for other baselines."
+            "Puzzle-embedding training currently supports only the following architectures: "
+            f"{supported}. Received '{architecture}'. Use training.mode=incontext for other baselines."
         )
 
     size_cfg = cfg.model.size
@@ -409,12 +476,16 @@ def prepare_embedding_model(
         )  # type: ignore[assignment]
 
     model_kwargs = dict(model_kwargs or {})
-    if architecture in RECURSIVE_ARCHITECTURES:
+    if architecture in PUZZLE_EMBED_ARCHITECTURES:
         model_kwargs["num_puzzle_identifiers"] = max(1, num_puzzle_identifiers)
         if "puzzle_emb_ndim" not in model_kwargs:
-            model_kwargs["puzzle_emb_ndim"] = model_kwargs.get(
-                "hidden_size", tokens.num_colors
+            default_dim = (
+                model_kwargs.get("hidden_size")
+                or model_kwargs.get("embedding_dim")
+                or model_kwargs.get("input_embedding_dim")
+                or tokens.num_colors
             )
+            model_kwargs["puzzle_emb_ndim"] = default_dim
 
     baseline_config = BaselineConfig(
         input_vocab_size=tokens.vocab_size,
@@ -424,6 +495,7 @@ def prepare_embedding_model(
         device=device,
         dtype=dtype,
         model_kwargs=model_kwargs,
+        pad_token_id=int(tokens.pad_id),
     )
     model = create_baseline(architecture, baseline_config)
     return model.to(device=device, dtype=dtype)
@@ -469,6 +541,7 @@ def make_training_dataloader(
         shuffle=shuffle_enabled,
         shuffle_buffer=shuffle_buffer,
         seed=seed,
+        include_support=True,
     )
 
     if int(cfg.data.num_workers) != 0:
@@ -517,6 +590,7 @@ def make_evaluation_loader(
         shuffle_buffer=None,
         seed=int(cfg.seed),
         include_query=True,
+        include_support=False,
     )
 
     collate_fn = build_puzzle_embedding_collate_fn(
@@ -589,8 +663,14 @@ def run(cfg: DictConfig) -> None:
         total_pairs,
     )
 
+    training_datasets = [
+        (name, split_datasets[name])
+        for name in ordered_split_names
+        if name in split_datasets
+    ]
+
     train_loader = make_training_dataloader(
-        datasets=[(train_split, split_datasets[train_split])],
+        datasets=training_datasets,
         tokens=tokens,
         cfg=cfg,
         identifier_table=identifier_table,
@@ -646,13 +726,32 @@ def run(cfg: DictConfig) -> None:
         num_puzzle_identifiers=identifier_table.size,
     )
     is_recursive = architecture in RECURSIVE_ARCHITECTURES
+    uses_puzzle_identifiers = bool(
+        getattr(model, "requires_puzzle_identifiers", architecture in PUZZLE_EMBED_ARCHITECTURES)
+    )
     puzzle_embeddings: list[CastedSparseEmbedding] = []
     if is_recursive:
         puzzle_embeddings = collect_puzzle_embeddings(model)
 
+    total_parameters = sum(param.numel() for param in model.parameters())
+    puzzle_free_parameters = compute_puzzle_free_parameter_count(
+        cfg,
+        tokens,
+        architecture=architecture,
+    )
+    LOGGER.info(
+        "Model parameter count: %d (excluding puzzle embeddings: %d)",
+        int(total_parameters),
+        int(puzzle_free_parameters),
+    )
     if wandb_module and wandb_run:
-        num_parameters = sum(param.numel() for param in model.parameters())
-        wandb_run.summary["model/num_parameters"] = int(num_parameters)
+        wandb_run.summary["model/num_parameters"] = int(puzzle_free_parameters)
+        wandb_module.log({"model/num_parameters": float(puzzle_free_parameters)}, step=0)
+        wandb_run.summary["model/num_parameters_with_puzzle_embeddings"] = int(total_parameters)
+        wandb_module.log(
+            {"model/num_parameters_with_puzzle_embeddings": float(total_parameters)},
+            step=0,
+        )
 
     recursive_cfg = cfg.get("recursive_trainer", {})
     puzzle_optimizer: Optional[PuzzleEmbeddingOptimizer] = None
@@ -789,7 +888,7 @@ def run(cfg: DictConfig) -> None:
             logits = forward_embedding_batch(
                 model,
                 batch,
-                is_recursive=is_recursive,
+                use_puzzle_identifiers=uses_puzzle_identifiers,
             )
             stats = compute_batch_loss(
                 logits,
@@ -889,6 +988,7 @@ def run(cfg: DictConfig) -> None:
                     device=device,
                     ignore_index=ignore_index,
                     is_recursive=is_recursive,
+                    use_puzzle_identifiers=uses_puzzle_identifiers,
                     tokens=tokens,
                     seed=seed,
                     tta_cfg=eval_tta_cfg,
@@ -939,6 +1039,14 @@ def run(cfg: DictConfig) -> None:
 
     LOGGER.info("Finished training at step %d", global_step)
 
+    restored_checkpoint_path: Optional[Path] = None
+    if checkpoint_manager:
+        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model)
+        if restored_checkpoint_path is None:
+            LOGGER.info(
+                "Proceeding with in-memory model parameters for test evaluation (no saved checkpoint)."
+            )
+
     test_metrics_by_split: Dict[str, Dict[str, float]] = {}
     test_aggregated_metrics: Dict[str, float] = {}
     if test_loaders:
@@ -952,6 +1060,7 @@ def run(cfg: DictConfig) -> None:
                 device=device,
                 ignore_index=ignore_index,
                 is_recursive=is_recursive,
+                use_puzzle_identifiers=uses_puzzle_identifiers,
                 tokens=tokens,
                 seed=seed,
                 tta_cfg=eval_tta_cfg,

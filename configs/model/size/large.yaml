@@ -3,12 +3,22 @@ size: large
 variants:
   rnn:
     hidden_size: 1536
+  rnn_ar:
+    hidden_size: 768
+    teacher_forcing: true
   transformer:
+    embedding_dim: 448
+    num_layers: 4
+    num_heads: 8
+    dropout_prob: 0.1
+    widening_factor: 4
+  transformer_ar:
     embedding_dim: 320
     num_layers: 4
     num_heads: 8
     dropout_prob: 0.1
     widening_factor: 4
+    teacher_forcing: true
   cnn1d:
     embedding_dim: 256
     hidden_channels: 896
@@ -68,10 +78,10 @@ variants:
     halt_exploration_prob: 0.1
     halt_max_steps: 16
     H_cycles: 1  # kept for compatibility
-    H_layers: 8
-    hidden_size: 512
-    num_heads: 12
-    expansion: 4
+    H_layers: 6
+    hidden_size: 384
+    num_heads: 8
+    expansion: 2.5
     puzzle_emb_ndim: ${.hidden_size}
     pos_encodings: rope
     forward_dtype: bfloat16

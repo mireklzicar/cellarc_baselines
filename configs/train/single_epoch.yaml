@@ -5,6 +5,9 @@ defaults:
 
 seed: 1337
 
+training:
+  mode: incontext
+
 dataset:
   benchmark: cellarc_100k
   train_split: train

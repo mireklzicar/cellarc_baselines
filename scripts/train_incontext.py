@@ -510,6 +510,36 @@ class CheckpointManager:
                     self._best_path,
                 )
 
+    def load_best_checkpoint(self, model: torch.nn.Module) -> Optional[Path]:
+        """Load the best-available checkpoint into ``model`` for downstream evaluation."""
+
+        if not isinstance(model, torch.nn.Module):
+            LOGGER.warning("Attempted to load a checkpoint for a non-torch model; skipping.")
+            return None
+
+        target_path: Optional[Path] = None
+        if self._best_path.exists() and (self._best_saved or self.best_metrics is not None):
+            target_path = self._best_path
+        elif self._last_path.exists():
+            target_path = self._last_path
+
+        if target_path is None:
+            LOGGER.warning(
+                "No checkpoint artifacts were found in %s; continuing with in-memory weights.",
+                self.directory,
+            )
+            return None
+
+        try:
+            state_dict = torch.load(target_path, map_location="cpu")
+            model.load_state_dict(state_dict)
+        except Exception as exc:
+            LOGGER.error("Failed to load checkpoint %s: %s", target_path, exc)
+            return None
+
+        LOGGER.info("Restored model weights from %s for evaluation.", target_path)
+        return target_path
+
     def finalize(
         self,
         *,
@@ -625,6 +655,7 @@ def prepare_baseline_model(
         device=device,
         dtype=dtype,
         model_kwargs=model_kwargs or {},
+        pad_token_id=int(tokens.pad_id),
     )
     model = create_baseline(architecture, baseline_config)
     return model, device
@@ -711,10 +742,19 @@ def forward_batch(
     """Forward pass abstraction handling optional target tensors."""
 
     inputs = batch["inputs"]
-    targets = batch["targets"]
-    if getattr(model, "requires_targets", False):
-        return model(inputs, targets=targets)
-    return model(inputs)
+    targets = batch.get("targets")
+    loss_mask = batch.get("loss_mask")
+
+    model_kwargs: Dict[str, torch.Tensor] = {}
+    if targets is not None:
+        model_kwargs["targets"] = targets
+    if loss_mask is not None and getattr(model, "accepts_loss_mask", False):
+        model_kwargs["loss_mask"] = loss_mask
+
+    if getattr(model, "requires_targets", False) and "targets" not in model_kwargs:
+        raise ValueError("Model requires targets but none were provided.")
+
+    return model(inputs, **model_kwargs)
 
 
 def evaluate(
@@ -1357,9 +1397,11 @@ def run(cfg: DictConfig) -> None:
     model, device = prepare_baseline_model(cfg, tokens)
     model.to(device)
 
+    num_parameters = sum(param.numel() for param in model.parameters())
+    LOGGER.info("Model parameter count: %d", int(num_parameters))
     if wandb_module and wandb_run:
-        num_parameters = sum(param.numel() for param in model.parameters())
         wandb_run.summary["model/num_parameters"] = int(num_parameters)
+        wandb_module.log({"model/num_parameters": float(num_parameters)}, step=0)
 
     if wandb_module and wandb_run and wandb_cfg and wandb_cfg.get("log_model", False):
         wandb_module.watch(model, log="all", log_freq=max(1, int(cfg.trainer.log_every)))
@@ -1746,6 +1788,14 @@ def run(cfg: DictConfig) -> None:
         last_logged_step = int(last_step_stats["step"])
 
     LOGGER.info("Training complete. Ran for %d optimisation steps.", global_step)
+
+    restored_checkpoint_path: Optional[Path] = None
+    if checkpoint_manager:
+        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model)
+        if restored_checkpoint_path is None:
+            LOGGER.info(
+                "Proceeding with in-memory model parameters for test evaluation (no saved checkpoint)."
+            )
 
     test_metrics_by_split: Dict[str, Dict[str, float]] = {}
     test_aggregated_metrics: Dict[str, float] = {}

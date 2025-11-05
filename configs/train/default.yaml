@@ -46,16 +46,16 @@ model:
 
 optimizer:
   name: adamw
-  lr: 0.0005
+  lr: 0.0001
   weight_decay: 0.0
   betas: [0.9, 0.999]
   eps: 1e-8
   warmup_steps: 0
 
 recursive_trainer:
-  lr: 1.0e-4
+  lr: 0.0001
   lr_min_ratio: 1.0
-  lr_warmup_steps: 2000
+  lr_warmup_steps: 1000
   lr_cycles: 0.5
   weight_decay: 0.0
   puzzle_emb_lr: 1.0e-2
@@ -67,7 +67,7 @@ recursive_trainer:
   gradient_accumulation: ${trainer.gradient_accumulation}
 
 trainer:
-  num_epochs: 10
+  num_epochs: 50
   max_steps: null
   eval_every: null
   log_every: 50

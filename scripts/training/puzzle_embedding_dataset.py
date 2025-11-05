@@ -231,6 +231,7 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
         shuffle_buffer: Optional[int],
         seed: int,
         include_query: bool = False,
+        include_support: bool = True,
     ) -> None:
         super().__init__()
         self._datasets = datasets
@@ -244,6 +245,7 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
         self._seed = seed
         self._iteration = 0
         self._include_query = bool(include_query)
+        self._include_support = bool(include_support)
 
     def __iter__(self) -> Iterator[PuzzleEmbeddingSample]:
         if not self._shuffle:
@@ -252,17 +254,18 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
                     episode_id = str(episode.get("id"))
                     puzzle_key = f"{split_name}:{episode_id}"
                     puzzle_identifier = self._identifier_table.get_or_create(puzzle_key)
-                    for pair in episode.get("train", []):
-                        sample = build_support_sample(
-                            puzzle_identifier=puzzle_identifier,
-                            pair=pair,
-                            tokens=self._tokens,
-                            ignore_index=self._ignore_index,
-                            max_seq_len=self._max_seq_len,
-                            drop_long=self._drop_long,
-                        )
-                        if sample is not None:
-                            yield sample
+                    if self._include_support:
+                        for pair in episode.get("train", []):
+                            sample = build_support_sample(
+                                puzzle_identifier=puzzle_identifier,
+                                pair=pair,
+                                tokens=self._tokens,
+                                ignore_index=self._ignore_index,
+                                max_seq_len=self._max_seq_len,
+                                drop_long=self._drop_long,
+                            )
+                            if sample is not None:
+                                yield sample
                     if self._include_query:
                         query_sample = build_query_sample(
                             puzzle_identifier=puzzle_identifier,
@@ -288,21 +291,22 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
                 episode_id = str(episode.get("id"))
                 puzzle_key = f"{split_name}:{episode_id}"
                 puzzle_identifier = self._identifier_table.get_or_create(puzzle_key)
-                for pair in episode.get("train", []):
-                    sample = build_support_sample(
-                        puzzle_identifier=puzzle_identifier,
-                        pair=pair,
-                        tokens=self._tokens,
-                        ignore_index=self._ignore_index,
-                        max_seq_len=self._max_seq_len,
-                        drop_long=self._drop_long,
-                    )
-                    if sample is None:
-                        continue
-                    buffer.append(sample)
-                    if len(buffer) >= buffer_size:
-                        idx = rng.randrange(len(buffer))
-                        yield buffer.pop(idx)
+                if self._include_support:
+                    for pair in episode.get("train", []):
+                        sample = build_support_sample(
+                            puzzle_identifier=puzzle_identifier,
+                            pair=pair,
+                            tokens=self._tokens,
+                            ignore_index=self._ignore_index,
+                            max_seq_len=self._max_seq_len,
+                            drop_long=self._drop_long,
+                        )
+                        if sample is None:
+                            continue
+                        buffer.append(sample)
+                        if len(buffer) >= buffer_size:
+                            idx = rng.randrange(len(buffer))
+                            yield buffer.pop(idx)
                 if self._include_query:
                     query_sample = build_query_sample(
                         puzzle_identifier=puzzle_identifier,

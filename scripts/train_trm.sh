@@ -11,7 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_PY="${SCRIPT_DIR}/train.py"
 
-ARCHES=( tiny_recursive )
+# tiny_recursive
+ARCHES=( transformer )
 SIZES=( medium large )
 
 train_one() {
@@ -21,16 +22,18 @@ train_one() {
 
   for arch in "${ARCHES[@]}"; do
     echo "--- Training '${arch}' (${size}) mode=${mode} tta=${tta} ---"
+    local run_name="${arch}_${mode}_tta_${tta}"
     python "${TRAIN_PY}" \
-      --config-name train/default \
+      --config-name train/single_epoch \
       model.architecture="${arch}" \
-      model.size="${size}" \
+      model/size="${size}" \
       training.mode="${mode}" \
       eval.tta.enabled="${tta}" \
       trainer.checkpoints.enabled=true \
       logging.wandb.enabled=true \
-      logging.wandb.project="trm_test_${size}" \
-      logging.wandb.group="trm_${mode}_$( [[ "${tta}" == "true" ]] && echo tta || echo notta )"
+      logging.wandb.project="single_trm_test_${size}_${mode}" \
+      logging.wandb.group="trm_${mode}_$( [[ "${tta}" == "true" ]] && echo tta || echo notta )" \
+      logging.wandb.name="${run_name}"
   done
 }
 
@@ -47,10 +50,10 @@ run_band() {
 run_band embedding false
 
 # 2) Puzzle-embedding, with TTA
-run_band embedding true
+#run_band embedding true
 
 # 3) In-context, no TTA
 run_band incontext false
 
 # 4) In-context, with TTA
-run_band incontext true
+#run_band incontext true
