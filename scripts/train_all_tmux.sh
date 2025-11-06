@@ -11,6 +11,9 @@ set -euo pipefail
 SKIP_FIRST_RUN=false
 SKIP_COMPLETED=false
 SESSION_PREFIX="train_all_gpu"
+# Optional explicit GPU list and run specs
+EXPLICIT_GPUS=()
+EXPLICIT_SPECS=()  # each item: arch:size:mode
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-first-run)
@@ -20,6 +23,17 @@ while [[ $# -gt 0 ]]; do
     --skip-completed|--resume)
       SKIP_COMPLETED=true
       shift
+      ;;
+    --gpus)
+      IFS=',' read -r -a EXPLICIT_GPUS <<< "$2"; shift 2
+      ;;
+    --run)
+      EXPLICIT_SPECS+=("$2"); shift 2
+      ;;
+    --runs)
+      IFS=',' read -r -a _specs_tmp <<< "$2"; shift 2
+      for s in "${_specs_tmp[@]}"; do EXPLICIT_SPECS+=("$s"); done
+      unset _specs_tmp
       ;;
     --session-prefix)
       SESSION_PREFIX="$2"; shift 2
@@ -45,8 +59,12 @@ chmod +x "${SCRIPT_DIR}/tmux_run_wrapper.sh" \
            "${SCRIPT_DIR}/tmux_queue_worker.sh" \
            "${SCRIPT_DIR}/tmux_runs_status.sh" 2>/dev/null || true
 
-# GPU list (default 0,1,2)
-GPUS=(0 1 2)
+# GPU list (default 0,1,2) or overridden by --gpus
+if [[ ${#EXPLICIT_GPUS[@]} -gt 0 ]]; then
+  GPUS=("${EXPLICIT_GPUS[@]}")
+else
+  GPUS=(0 1 2)
+fi
 
 # Architectures and modes mirror scripts/train_all.sh
 ARCHES=(
@@ -161,26 +179,37 @@ add_run() {
   RUN_CMDS+=("${cmd[*]}")
 }
 
-for size in "${SIZES[@]}"; do
-  for mode in "${MODES[@]}"; do
-    for arch in "${ARCHES[@]}"; do
-      if [[ "${mode}" == "embedding" ]] && ! supports_embedding "${arch}"; then
-        continue
-      fi
-      if [[ "${SKIP_COMPLETED}" == "true" ]] && is_run_completed "${arch}" "${size}" "${mode}"; then
-        echo "--- Skipping completed '${arch}' (${size}) mode=${mode} ---"
-        continue
-      fi
-      if [[ "${SKIP_FIRST_RUN}" == "true" && ${run_idx} -eq 0 ]]; then
-        # Maintain parity with train_all.sh: skip the first generated run
+if [[ ${#EXPLICIT_SPECS[@]} -gt 0 ]]; then
+  for spec in "${EXPLICIT_SPECS[@]}"; do
+    IFS=':' read -r arch size mode <<< "${spec}"
+    if [[ -z "${arch:-}" || -z "${size:-}" || -z "${mode:-}" ]]; then
+      echo "Invalid --run spec '${spec}'. Expected 'arch:size:mode'." >&2
+      exit 2
+    fi
+    add_run "${arch}" "${size}" "${mode}"
+  done
+else
+  for size in "${SIZES[@]}"; do
+    for mode in "${MODES[@]}"; do
+      for arch in "${ARCHES[@]}"; do
+        if [[ "${mode}" == "embedding" ]] && ! supports_embedding "${arch}"; then
+          continue
+        fi
+        if [[ "${SKIP_COMPLETED}" == "true" ]] && is_run_completed "${arch}" "${size}" "${mode}"; then
+          echo "--- Skipping completed '${arch}' (${size}) mode=${mode} ---"
+          continue
+        fi
+        if [[ "${SKIP_FIRST_RUN}" == "true" && ${run_idx} -eq 0 ]]; then
+          # Maintain parity with train_all.sh: skip the first generated run
+          ((run_idx+=1))
+          continue
+        fi
+        add_run "${arch}" "${size}" "${mode}"
         ((run_idx+=1))
-        continue
-      fi
-      add_run "${arch}" "${size}" "${mode}"
-      ((run_idx+=1))
+      done
     done
   done
-done
+fi
 
 if [[ ${#RUN_IDS[@]} -eq 0 ]]; then
   echo "No runs were generated (check filters/flags)." >&2

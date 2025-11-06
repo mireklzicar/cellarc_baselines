@@ -1,0 +1,12 @@
+# Core training dependencies
+torch>=2.0
+numpy
+hydra-core
+omegaconf
+pydantic
+einops
+tqdm
+cellarc
+
+# Optional logging / tracking
+wandb
