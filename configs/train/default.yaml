@@ -18,12 +18,12 @@ dataset:
   root: null
 
 data:
-  batch_size: 64
+  batch_size: 768
   num_workers: 0
   max_seq_len: 272
   drop_long_episodes: false
   shuffle: true
-  shuffle_buffer: 1024
+  shuffle_buffer: 7680
   augmentation:
     enabled: true
     reverse_prob: 0.5
@@ -82,7 +82,7 @@ loss:
   ignore_index: -100
 
 eval:
-  batch_size: 64
+  batch_size: 768
   limit: null
   tta:
     enabled: false
@@ -93,7 +93,7 @@ eval:
     apply_to: "query_only"
 
 test:
-  batch_size: 64
+  batch_size: 768
   limit: null
 
 logging:
