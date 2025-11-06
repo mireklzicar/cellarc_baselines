@@ -9,11 +9,16 @@ set -euo pipefail
 #   --session-prefix STR Customize tmux session name prefix (default: train_all_gpu)
 
 SKIP_FIRST_RUN=false
+SKIP_COMPLETED=false
 SESSION_PREFIX="train_all_gpu"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-first-run)
       SKIP_FIRST_RUN=true
+      shift
+      ;;
+    --skip-completed|--resume)
+      SKIP_COMPLETED=true
       shift
       ;;
     --session-prefix)
@@ -33,6 +38,12 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_PY="${SCRIPT_DIR}/train.py"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Ensure helper scripts are executable (idempotent)
+chmod +x "${SCRIPT_DIR}/tmux_run_wrapper.sh" \
+           "${SCRIPT_DIR}/tmux_queue_worker.sh" \
+           "${SCRIPT_DIR}/tmux_runs_status.sh" 2>/dev/null || true
 
 # GPU list (default 0,1,2)
 GPUS=(0 1 2)
@@ -71,13 +82,59 @@ supports_embedding() {
   return 1
 }
 
+# Consider a run completed if its checkpoint/evaluation summary exists
+is_run_completed() {
+  local arch="$1" size="$2" mode="$3"
+  local project="cellarc100k_50e_${mode}_${size}"
+  local run_id="${arch}_${size}_${mode}"
+  local checkpoint_dir="${REPO_ROOT}/outputs/${project}/${run_id}"
+  [[ -f "${checkpoint_dir}/evaluation.json" ]]
+}
+
 # Build the list of sizes from remaining args, default to medium large small
 SIZES=("$@")
 if [[ ${#SIZES[@]} -eq 0 ]]; then
-  SIZES=(large medium small)
+  SIZES=(medium large small)
 fi
 
-declare -a RUNS
+# Prune incomplete outputs: for requested sizes and both modes, remove run dirs
+# that do not contain any checkpoint file (*.pt). Useful for crashed OOM runs.
+prune_incomplete_outputs() {
+  local -a sizes=("$@")
+  local removed=0
+  for mode in "${MODES[@]}"; do
+    for size in "${sizes[@]}"; do
+      local project="cellarc100k_50e_${mode}_${size}"
+      local root="${REPO_ROOT}/outputs/${project}"
+      [[ -d "${root}" ]] || continue
+      while IFS= read -r -d '' run_dir; do
+        # If no .pt files inside the run directory, remove it
+        if ! compgen -G "${run_dir}"/*.pt > /dev/null; then
+          echo "Pruning incomplete run dir: ${run_dir}"
+          rm -rf -- "${run_dir}"
+          ((removed+=1))
+        fi
+      done < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -print0)
+    done
+  done
+  if (( removed > 0 )); then
+    echo "Pruned ${removed} incomplete output directorie(s)."
+  fi
+}
+
+if [[ "${SKIP_COMPLETED}" == "true" ]]; then
+  prune_incomplete_outputs "${SIZES[@]}"
+fi
+
+# Status/manifest directory for this runset
+RUNSET_ID="$(date +%Y%m%d-%H%M%S)"
+STATUS_ROOT="${REPO_ROOT}/outputs/tmux_runs"
+STATUS_DIR="${STATUS_ROOT}/${RUNSET_ID}"
+mkdir -p "${STATUS_DIR}"/{planned,in_progress,succeeded,failed,logs}
+MANIFEST="${STATUS_DIR}/manifest.tsv"
+echo -e "run_id\tarch\tsize\tmode\tgpu\tsession\tcommand" > "${MANIFEST}"
+
+declare -a RUN_IDS RUN_ARCHES RUN_SIZES RUN_MODES RUN_CMDS
 run_idx=0
 
 add_run() {
@@ -96,13 +153,22 @@ add_run() {
     "logging.wandb.group=mode_${mode}"
     "logging.wandb.name=${arch}_${size}_${mode}"
   )
-  RUNS+=("${cmd[*]}")
+  local run_id="${arch}_${size}_${mode}"
+  RUN_IDS+=("${run_id}")
+  RUN_ARCHES+=("${arch}")
+  RUN_SIZES+=("${size}")
+  RUN_MODES+=("${mode}")
+  RUN_CMDS+=("${cmd[*]}")
 }
 
 for size in "${SIZES[@]}"; do
   for mode in "${MODES[@]}"; do
     for arch in "${ARCHES[@]}"; do
       if [[ "${mode}" == "embedding" ]] && ! supports_embedding "${arch}"; then
+        continue
+      fi
+      if [[ "${SKIP_COMPLETED}" == "true" ]] && is_run_completed "${arch}" "${size}" "${mode}"; then
+        echo "--- Skipping completed '${arch}' (${size}) mode=${mode} ---"
         continue
       fi
       if [[ "${SKIP_FIRST_RUN}" == "true" && ${run_idx} -eq 0 ]]; then
@@ -116,29 +182,39 @@ for size in "${SIZES[@]}"; do
   done
 done
 
-if [[ ${#RUNS[@]} -eq 0 ]]; then
+if [[ ${#RUN_IDS[@]} -eq 0 ]]; then
   echo "No runs were generated (check filters/flags)." >&2
   exit 1
 fi
 
-# Shuffle the run list to randomize distribution
-shuffle_runs() {
+count=${#RUN_IDS[@]}
+
+# Shuffle indices to randomize processing order
+shuffle_indices() {
+  local n=$1
   if command -v shuf >/dev/null 2>&1; then
-    printf '%s\n' "${RUNS[@]}" | shuf
+    shuf -i 0-$((n-1))
   else
-    # Portable fallback: random key sort
-    awk 'BEGIN{srand()} {print rand()"\t"$0}' | sort -k1,1n | cut -f2-
+    # Fallback: simple seq (no randomization if shuf missing)
+    seq 0 $((n-1))
   fi
 }
 
-mapfile -t RUNS_SHUFFLED < <(shuffle_runs)
+mapfile -t IDX_SHUFFLED < <(shuffle_indices "$count")
 
-# Split runs round-robin across GPUs (balanced but randomized order)
-declare -a RUNS_BY_GPU
-for i in "${!RUNS_SHUFFLED[@]}"; do
-  gpu_index=$(( i % ${#GPUS[@]} ))
-  # Append with a real newline so each command is a line when read back
-  RUNS_BY_GPU[$gpu_index]="${RUNS_BY_GPU[$gpu_index]-}${RUNS_SHUFFLED[$i]}"$'\n'
+# Write all planned runs to the status directory; workers will claim dynamically
+for i in "${IDX_SHUFFLED[@]}"; do
+  run_id="${RUN_IDS[$i]}"
+  arch="${RUN_ARCHES[$i]}"
+  size="${RUN_SIZES[$i]}"
+  mode="${RUN_MODES[$i]}"
+  run_cmd="${RUN_CMDS[$i]}"
+  # Record planned entry and manifest row (GPU/session unknown yet)
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "${run_id}" "${arch}" "${size}" "${mode}" "-" "-" "${run_cmd}" >> "${MANIFEST}"
+  printf "gpu=-\nsession=-\narch=%s\nsize=%s\nmode=%s\n" \
+    "${arch}" "${size}" "${mode}" > "${STATUS_DIR}/planned/${run_id}.meta"
+  printf "%s\n" "${run_cmd}" > "${STATUS_DIR}/planned/${run_id}.cmd"
 done
 
 # Helper to assert session doesn't exist
@@ -165,21 +241,16 @@ for idx in "${!GPUS[@]}"; do
     echo "Failed to create tmux session '${session_name}'." >&2
     exit 1
   fi
+  tmux send-keys -t "${session_name}" "cd '${REPO_ROOT}'" C-m
   tmux send-keys -t "${session_name}" "export CUDA_VISIBLE_DEVICES=${gpu}" C-m
   tmux send-keys -t "${session_name}" "export PYTHONUNBUFFERED=1" C-m
+  tmux send-keys -t "${session_name}" "export RUNS_STATUS_DIR='${STATUS_DIR}'" C-m
+  tmux send-keys -t "${session_name}" "export TMUX_SESSION_NAME='${session_name}'" C-m
   tmux send-keys -t "${session_name}" "echo 'Session ${session_name} using CUDA_VISIBLE_DEVICES=${gpu}'" C-m
 
-  # Queue each run assigned to this GPU
-  if [[ -n "${RUNS_BY_GPU[$idx]:-}" ]]; then
-    # Iterate over newline-separated commands
-    while IFS= read -r run_cmd; do
-      [[ -z "${run_cmd}" ]] && continue
-      tmux send-keys -t "${session_name}" "echo '[GPU ${gpu}] >> ${run_cmd}'" C-m
-      tmux send-keys -t "${session_name}" "${run_cmd}" C-m
-    done <<< "${RUNS_BY_GPU[$idx]}"
-  else
-    tmux send-keys -t "${session_name}" "echo 'No runs assigned to this session.'" C-m
-  fi
+  # Start worker loop that will claim and run jobs dynamically
+  tmux send-keys -t "${session_name}" "echo '[GPU ${gpu}] Queue worker starting'" C-m
+  tmux send-keys -t "${session_name}" "bash scripts/tmux_queue_worker.sh '${gpu}'" C-m
 
   tmux send-keys -t "${session_name}" "echo 'All assigned runs finished for ${session_name}.'" C-m
 done
@@ -188,3 +259,8 @@ echo "Launched tmux sessions:"
 for s in "${SESSION_NAMES[@]}"; do
   echo "  - ${s}  (attach: tmux attach -t ${s})"
 done
+
+mkdir -p "${STATUS_ROOT}"
+ln -sfn "${STATUS_DIR}" "${STATUS_ROOT}/latest"
+echo "Runset status directory: ${STATUS_DIR}"
+echo "Summary: scripts/tmux_runs_status.sh  # uses outputs/tmux_runs/latest by default"
