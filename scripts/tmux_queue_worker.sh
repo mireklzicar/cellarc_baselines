@@ -54,7 +54,10 @@ claim_next() {
 while true; do
   if claim_next; then
     run_id="${CLAIMED_RUN_ID}"
-    scripts/tmux_run_wrapper.sh "${run_id}" "${GPU_ID}"
+    if ! scripts/tmux_run_wrapper.sh "${run_id}" "${GPU_ID}"; then
+      status=$?
+      echo "[worker gpu=${GPU_ID}] Run ${run_id} failed with exit status ${status}; continuing." >&2
+    fi
     unset CLAIMED_RUN_ID
     # Immediately try to claim another without sleeping
     continue

@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 if [[ $# -lt 2 ]]; then
   echo "Usage: tmux_run_wrapper.sh <run_id> <gpu>" >&2
   exit 2
@@ -51,6 +54,27 @@ CMD_STR="$(<"${CMD_SOURCE}")"
 LOG_FILE="${STATUS_DIR}/logs/${RUN_ID}.log"
 echo "[START ${START_TS}] ${RUN_ID} (GPU=${GPU})" | tee -a "${LOG_FILE}"
 
+PROJECT_NAME=""
+RUN_NAME="${RUN_ID}"
+declare -a CMD_ARGS
+IFS_BACKUP="${IFS}"
+IFS=' ' read -r -a CMD_ARGS <<< "${CMD_STR}"
+IFS="${IFS_BACKUP}"
+for arg in "${CMD_ARGS[@]}"; do
+  case "${arg}" in
+    logging.wandb.project=*)
+      PROJECT_NAME="${arg#logging.wandb.project=}"
+      ;;
+    logging.wandb.name=*)
+      RUN_NAME="${arg#logging.wandb.name=}"
+      ;;
+  esac
+done
+OUTPUT_DIR=""
+if [[ -n "${PROJECT_NAME}" && -n "${RUN_NAME}" ]]; then
+  OUTPUT_DIR="${REPO_ROOT}/outputs/${PROJECT_NAME}/${RUN_NAME}"
+fi
+
 # Execute the command in a login shell to load user envs consistently
 set +e
 bash -lc "${CMD_STR}" 2>&1 | tee -a "${LOG_FILE}"
@@ -58,6 +82,46 @@ EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
 END_TS="$(date -Is)"
+
+META_SOURCE=""
+if [[ -f "${INPROG_META}" ]]; then
+  META_SOURCE="${INPROG_META}"
+elif [[ -f "${PLANNED_META}" ]]; then
+  META_SOURCE="${PLANNED_META}"
+fi
+SIZE_NAME=""
+MODE_NAME=""
+if [[ -n "${META_SOURCE}" ]]; then
+  SIZE_NAME="$(awk -F= '$1=="size"{print $2; exit}' "${META_SOURCE}")"
+  MODE_NAME="$(awk -F= '$1=="mode"{print $2; exit}' "${META_SOURCE}")"
+fi
+
+FAILURE_REASON=""
+if [[ ${EXIT_CODE} -ne 0 ]]; then
+  if grep -qiE "CUDA (error: )?out of memory" "${LOG_FILE}"; then
+    FAILURE_REASON="cuda_oom"
+    echo "[CUDA OOM] Detected CUDA out-of-memory for ${RUN_ID}." | tee -a "${LOG_FILE}"
+    if [[ -z "${PROJECT_NAME}" || -z "${RUN_NAME}" ]]; then
+      if [[ -n "${MODE_NAME}" && -n "${SIZE_NAME}" ]]; then
+        PROJECT_NAME="cellarc100k_50e_${MODE_NAME}_${SIZE_NAME}"
+        if [[ -z "${OUTPUT_DIR}" ]]; then
+          OUTPUT_DIR="${REPO_ROOT}/outputs/${PROJECT_NAME}/${RUN_ID}"
+        fi
+      fi
+    fi
+    if [[ -n "${OUTPUT_DIR}" ]]; then
+      if [[ -d "${OUTPUT_DIR}" ]]; then
+        rm -rf -- "${OUTPUT_DIR}"
+        echo "[CUDA OOM] Removed incomplete output directory ${OUTPUT_DIR}" | tee -a "${LOG_FILE}"
+      else
+        echo "[CUDA OOM] Output directory ${OUTPUT_DIR} not found; nothing to remove." | tee -a "${LOG_FILE}"
+      fi
+    else
+      echo "[CUDA OOM] Unable to determine output directory for ${RUN_ID}." | tee -a "${LOG_FILE}"
+    fi
+  fi
+fi
+
 rm -f "${INPROG_META}" "${INPROG_CMD_FILE}"
 
 if [[ ${EXIT_CODE} -eq 0 ]]; then
@@ -76,6 +140,10 @@ DEST_META="${STATUS_DIR}/${DEST_DIR}/${RUN_ID}.meta"
   printf "gpu=%s\nsession=%s\nstart=%s\nend=%s\nexit_code=%s\ncmd=%s\n" \
     "${GPU}" "${TMUX_SESSION_NAME:-unknown}" "${START_TS}" "${END_TS}" "${EXIT_CODE}" "${CMD_STR}"
 } > "${DEST_META}"
+
+if [[ -n "${FAILURE_REASON}" ]]; then
+  printf "failure_reason=%s\n" "${FAILURE_REASON}" >> "${DEST_META}"
+fi
 
 echo "[END ${END_TS}] ${RUN_ID} (GPU=${GPU}) exit=${EXIT_CODE}" | tee -a "${LOG_FILE}"
 
