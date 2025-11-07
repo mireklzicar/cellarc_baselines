@@ -12,6 +12,8 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import hydra
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -58,6 +60,41 @@ PUZZLE_EMBED_ARCHITECTURES = {
     "nca1d",
 }
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def init_distributed_from_env() -> Tuple[bool, int, int, Optional[int], Optional[dist.ProcessGroup]]:
+    """Initialise distributed training when torchrun-provided environment variables are present."""
+
+    if not dist.is_available():
+        return False, 0, 1, None, None
+
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    if local_rank_env is None:
+        return False, 0, 1, None, None
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(local_rank_env)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    cpu_process_group: Optional[dist.ProcessGroup]
+    if backend == "nccl":
+        cpu_process_group = dist.new_group(backend="gloo")
+    else:
+        cpu_process_group = dist.group.WORLD
+
+    return True, rank, world_size, local_rank, cpu_process_group
+
+
+def unwrap_distributed_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying module if ``model`` is wrapped with DistributedDataParallel."""
+
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 def cosine_schedule_with_warmup(
@@ -519,6 +556,9 @@ def make_training_dataloader(
     identifier_table: PuzzleIdentifierTable,
     ignore_index: int,
     seed: int,
+    rank: int = 0,
+    world_size: int = 1,
+    shard_across_ranks: bool = False,
 ) -> DataLoader:
     """Construct the primary training dataloader for embedding supervision."""
 
@@ -542,6 +582,9 @@ def make_training_dataloader(
         shuffle_buffer=shuffle_buffer,
         seed=seed,
         include_support=True,
+        rank=rank,
+        world_size=world_size,
+        shard_across_ranks=shard_across_ranks,
     )
 
     if int(cfg.data.num_workers) != 0:
@@ -614,11 +657,27 @@ def run(cfg: DictConfig) -> None:
     LOGGER.info("Repository root: %s", REPO_ROOT)
     LOGGER.info("Configuration:\n%s", OmegaConf.to_yaml(cfg))
 
-    set_all_seeds(int(cfg.seed))
+    is_distributed, rank, world_size, local_rank, cpu_process_group = init_distributed_from_env()
+    if is_distributed:
+        LOGGER.info(
+            "Distributed embedding training enabled (rank=%s, world_size=%s, local_rank=%s).",
+            rank,
+            world_size,
+            local_rank,
+        )
+    should_log = (rank == 0)
 
-    wandb_run, wandb_module = init_wandb(cfg)
+    base_seed = int(cfg.seed)
+    set_all_seeds(base_seed + (rank if is_distributed else 0))
+    seed = base_seed
+
     logging_cfg = cfg.get("logging", None)
     wandb_cfg = logging_cfg.get("wandb", None) if logging_cfg else None
+    if should_log:
+        wandb_run, wandb_module = init_wandb(cfg)
+    else:
+        wandb_run = None
+        wandb_module = None
 
     tokens = TokenVocabulary(
         num_colors=int(cfg.tokens.num_colors),
@@ -628,10 +687,9 @@ def run(cfg: DictConfig) -> None:
         query_id=int(cfg.tokens.query_id),
         target_id=int(cfg.tokens.target_id),
         mask_id=int(cfg.tokens.mask_id),
-    eos_id=int(cfg.tokens.eos_id),
-)
+        eos_id=int(cfg.tokens.eos_id),
+    )
     ignore_index = int(cfg.loss.ignore_index)
-    seed = int(cfg.seed)
     augmentation_settings = resolve_augmentation_settings(cfg, tokens)
 
     train_split = str(cfg.dataset.train_split)
@@ -676,25 +734,29 @@ def run(cfg: DictConfig) -> None:
         identifier_table=identifier_table,
         ignore_index=ignore_index,
         seed=seed,
+        rank=rank,
+        world_size=world_size,
+        shard_across_ranks=is_distributed,
     )
 
     eval_batch_size = int(cfg.eval.batch_size)
     eval_tta_cfg = cfg.eval.get("tta", None)
     eval_loaders: Dict[str, DataLoader] = {}
-    for split_name in eval_split_names:
-        eval_loaders[split_name] = make_evaluation_loader(
-            split_name=split_name,
-            dataset=split_datasets[split_name],
-            tokens=tokens,
-            cfg=cfg,
-            identifier_table=identifier_table,
-            batch_size=eval_batch_size,
-            ignore_index=ignore_index,
-        )
+    if should_log:
+        for split_name in eval_split_names:
+            eval_loaders[split_name] = make_evaluation_loader(
+                split_name=split_name,
+                dataset=split_datasets[split_name],
+                tokens=tokens,
+                cfg=cfg,
+                identifier_table=identifier_table,
+                batch_size=eval_batch_size,
+                ignore_index=ignore_index,
+            )
 
     test_cfg = cfg.get("test", {})
     test_loaders: Dict[str, DataLoader] = {}
-    if test_split_names:
+    if should_log and test_split_names:
         test_batch_size = int(test_cfg.get("batch_size", eval_batch_size))
         for split_name in test_split_names:
             test_loaders[split_name] = make_evaluation_loader(
@@ -715,7 +777,12 @@ def run(cfg: DictConfig) -> None:
     dtype_name = str(cfg.model.dtype)
     dtype = getattr(torch, dtype_name)
     requested_device = str(cfg.model.device)
-    device = detect_device(requested_device)
+    if is_distributed:
+        if local_rank is None:
+            raise RuntimeError("LOCAL_RANK must be provided for distributed embedding training.")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = detect_device(requested_device)
 
     model = prepare_embedding_model(
         cfg,
@@ -725,13 +792,22 @@ def run(cfg: DictConfig) -> None:
         batch_size=int(cfg.data.batch_size),
         num_puzzle_identifiers=identifier_table.size,
     )
+    if is_distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            find_unused_parameters=True,
+            static_graph=False,
+        )
+    model_to_track = unwrap_distributed_model(model)
     is_recursive = architecture in RECURSIVE_ARCHITECTURES
     uses_puzzle_identifiers = bool(
         getattr(model, "requires_puzzle_identifiers", architecture in PUZZLE_EMBED_ARCHITECTURES)
     )
     puzzle_embeddings: list[CastedSparseEmbedding] = []
     if is_recursive:
-        puzzle_embeddings = collect_puzzle_embeddings(model)
+        puzzle_embeddings = collect_puzzle_embeddings(model_to_track)
 
     total_parameters = sum(param.numel() for param in model.parameters())
     puzzle_free_parameters = compute_puzzle_free_parameter_count(
@@ -781,6 +857,7 @@ def run(cfg: DictConfig) -> None:
                 puzzle_embeddings,
                 lr=puzzle_lr,
                 weight_decay=puzzle_weight_decay,
+                process_group=cpu_process_group if is_distributed else None,
             )
         scheduler = {
             "base_lr": lr,
@@ -792,7 +869,7 @@ def run(cfg: DictConfig) -> None:
         if use_ema:
             ema_decay = float(recursive_cfg.get("ema_decay", 0.999))
             ema_helper = EMAHelper(decay=ema_decay)
-            ema_helper.register(model)
+            ema_helper.register(model_to_track)
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -818,8 +895,16 @@ def run(cfg: DictConfig) -> None:
     gradient_accumulation = max(1, int(recursive_grad_acc if is_recursive else cfg.trainer.gradient_accumulation))
     clip_grad_norm = cfg.trainer.clip_grad_norm
 
+    samples_per_epoch = total_pairs
+    if is_distributed:
+        if total_pairs < world_size:
+            raise ValueError(
+                f"Distributed training requested with world_size={world_size}, "
+                f"but only {total_pairs} training samples are available."
+            )
+        samples_per_epoch = max(1, total_pairs // world_size)
     micro_batches_per_epoch = math.ceil(
-        total_pairs / max(1, int(cfg.data.batch_size))
+        samples_per_epoch / max(1, int(cfg.data.batch_size))
     )
     updates_per_epoch = math.ceil(micro_batches_per_epoch / gradient_accumulation)
 
@@ -847,7 +932,7 @@ def run(cfg: DictConfig) -> None:
 
     checkpoint_manager: Optional[CheckpointManager] = None
     checkpoint_cfg = cfg.trainer.get("checkpoints", None)
-    if checkpoint_cfg and bool(checkpoint_cfg.get("enabled", False)):
+    if should_log and checkpoint_cfg and bool(checkpoint_cfg.get("enabled", False)):
         checkpoint_dir = resolve_checkpoint_directory(
             checkpoint_cfg=checkpoint_cfg,
             wandb_cfg=wandb_cfg,
@@ -935,7 +1020,7 @@ def run(cfg: DictConfig) -> None:
                 if puzzle_optimizer:
                     puzzle_optimizer.zero_grad()
                 if ema_helper:
-                    ema_helper.update(model)
+                    ema_helper.update(model_to_track)
 
                 current_lr = optimizer.param_groups[0]["lr"]
                 global_step += 1
@@ -949,7 +1034,7 @@ def run(cfg: DictConfig) -> None:
                     "tokens": int(step_tokens),
                 }
 
-                if step_tokens > 0 and global_step % log_every == 0:
+                if should_log and step_tokens > 0 and global_step % log_every == 0:
                     last_train_metrics = log_training_metrics(
                         epoch=current_epoch,
                         step=global_step,
@@ -977,13 +1062,13 @@ def run(cfg: DictConfig) -> None:
         if eval_every is not None and current_epoch % eval_every != 0:
             continue
 
-        if eval_loaders:
+        if should_log and eval_loaders:
             ema_backup = {}
             if ema_helper:
-                ema_backup = ema_helper.swap_to_shadow(model)
+                ema_backup = ema_helper.swap_to_shadow(model_to_track)
             try:
                 eval_metrics_by_split = evaluate_embedding_splits(
-                    model,
+                    model_to_track,
                     eval_loaders,
                     device=device,
                     ignore_index=ignore_index,
@@ -996,7 +1081,7 @@ def run(cfg: DictConfig) -> None:
                 )
             finally:
                 if ema_helper:
-                    ema_helper.restore(model, ema_backup)
+                    ema_helper.restore(model_to_track, ema_backup)
             latest_eval_by_split = eval_metrics_by_split
             latest_eval_metrics = aggregate_split_metrics(eval_metrics_by_split)
             log_split_metrics(
@@ -1010,13 +1095,13 @@ def run(cfg: DictConfig) -> None:
 
             if checkpoint_manager:
                 if ema_helper:
-                    ema_backup = ema_helper.swap_to_shadow(model)
+                    ema_backup = ema_helper.swap_to_shadow(model_to_track)
                 else:
                     ema_backup = {}
                 try:
-                    checkpoint_manager.save_last(model)
+                    checkpoint_manager.save_last(model_to_track)
                     checkpoint_manager.record_evaluation(
-                        model=model,
+                        model=model_to_track,
                         aggregated_metrics=latest_eval_metrics or {},
                         metrics_by_split=latest_eval_by_split,
                         epoch=current_epoch,
@@ -1024,24 +1109,24 @@ def run(cfg: DictConfig) -> None:
                     )
                 finally:
                     if ema_helper:
-                        ema_helper.restore(model, ema_backup)
+                        ema_helper.restore(model_to_track, ema_backup)
 
         elif checkpoint_manager:
             if ema_helper:
-                ema_backup = ema_helper.swap_to_shadow(model)
+                ema_backup = ema_helper.swap_to_shadow(model_to_track)
             else:
                 ema_backup = {}
             try:
-                checkpoint_manager.save_last(model)
+                checkpoint_manager.save_last(model_to_track)
             finally:
                 if ema_helper:
-                    ema_helper.restore(model, ema_backup)
+                    ema_helper.restore(model_to_track, ema_backup)
 
     LOGGER.info("Finished training at step %d", global_step)
 
     restored_checkpoint_path: Optional[Path] = None
     if checkpoint_manager:
-        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model)
+        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model_to_track)
         if restored_checkpoint_path is None:
             LOGGER.info(
                 "Proceeding with in-memory model parameters for test evaluation (no saved checkpoint)."
@@ -1049,13 +1134,13 @@ def run(cfg: DictConfig) -> None:
 
     test_metrics_by_split: Dict[str, Dict[str, float]] = {}
     test_aggregated_metrics: Dict[str, float] = {}
-    if test_loaders:
+    if should_log and test_loaders:
         ema_backup = {}
         if ema_helper:
-            ema_backup = ema_helper.swap_to_shadow(model)
+            ema_backup = ema_helper.swap_to_shadow(model_to_track)
         try:
             test_metrics_by_split = evaluate_embedding_splits(
-                model,
+                model_to_track,
                 test_loaders,
                 device=device,
                 ignore_index=ignore_index,
@@ -1068,7 +1153,7 @@ def run(cfg: DictConfig) -> None:
             )
         finally:
             if ema_helper:
-                ema_helper.restore(model, ema_backup)
+                ema_helper.restore(model_to_track, ema_backup)
         test_aggregated_metrics = aggregate_split_metrics(test_metrics_by_split)
         log_split_metrics(
             tag="test",
@@ -1162,6 +1247,12 @@ def run(cfg: DictConfig) -> None:
                     "query/accuracy"
                 )
         wandb_run.finish()
+
+    if is_distributed:
+        dist.barrier()
+        if cpu_process_group not in (None, dist.group.WORLD):
+            dist.destroy_process_group(cpu_process_group)
+        dist.destroy_process_group()
 
 
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)

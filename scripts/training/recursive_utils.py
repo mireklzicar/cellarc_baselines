@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 try:
@@ -26,17 +27,27 @@ class PuzzleEmbeddingOptimizer:
         *,
         lr: float,
         weight_decay: float,
+        process_group: Optional[dist.ProcessGroup] = None,
     ) -> None:
         self._embeddings = [module for module in embeddings]
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
+        self._process_group = process_group
+        self._world_size = 1
+        if process_group is not None:
+            try:
+                self._world_size = dist.get_world_size(process_group)
+            except Exception:
+                self._world_size = 1
 
     def state_dict(self) -> Dict[str, float]:
-        return {"lr": self.lr, "weight_decay": self.weight_decay}
+        return {"lr": self.lr, "weight_decay": self.weight_decay, "world_size": float(self._world_size)}
 
     def load_state_dict(self, state_dict: Mapping[str, float]) -> None:
         self.lr = float(state_dict.get("lr", self.lr))
         self.weight_decay = float(state_dict.get("weight_decay", self.weight_decay))
+        if "world_size" in state_dict:
+            self._world_size = int(state_dict["world_size"])
 
     @torch.no_grad()
     def step(self) -> None:
@@ -72,6 +83,15 @@ class PuzzleEmbeddingOptimizer:
             grad_sum.scatter_add_(0, scatter_index, grad)
 
             weights = embedding.weights
+            if self._process_group is not None and self._world_size > 1:
+                unique_ids, grad_sum = self._all_gather_sparse_grads(
+                    unique_ids=unique_ids,
+                    grad_sum=grad_sum,
+                    device=weights.device,
+                )
+                if unique_ids.numel() == 0:
+                    continue
+
             unique_ids_long = unique_ids.to(dtype=torch.long)
             updated = weights.index_select(0, unique_ids_long)
             if self.weight_decay:
@@ -86,6 +106,48 @@ class PuzzleEmbeddingOptimizer:
         for embedding in self._embeddings:
             if hasattr(embedding, "clear_local_grad"):
                 embedding.clear_local_grad()
+
+    def _all_gather_sparse_grads(
+        self,
+        *,
+        unique_ids: torch.Tensor,
+        grad_sum: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gathered: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * self._world_size
+        payload = (
+            unique_ids.detach().to(device="cpu"),
+            grad_sum.detach().to(device="cpu"),
+        )
+        dist.all_gather_object(gathered, payload, group=self._process_group)
+
+        merged_ids: List[torch.Tensor] = []
+        merged_grads: List[torch.Tensor] = []
+        for item in gathered:
+            if item is None:
+                continue
+            ids_tensor, grad_tensor = item
+            if ids_tensor.numel() == 0:
+                continue
+            merged_ids.append(ids_tensor.to(device=device))
+            merged_grads.append(grad_tensor.to(device=device))
+
+        if not merged_ids:
+            return (
+                unique_ids.new_zeros((0,), device=device),
+                grad_sum.new_zeros((0, grad_sum.size(1)), device=device),
+            )
+
+        all_ids = torch.cat(merged_ids, dim=0)
+        all_grads = torch.cat(merged_grads, dim=0)
+        merged_unique, inverse = torch.unique(all_ids, return_inverse=True)
+        aggregated = torch.zeros(
+            (merged_unique.size(0), all_grads.size(1)),
+            dtype=all_grads.dtype,
+            device=device,
+        )
+        aggregated.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, all_grads.size(1)), all_grads)
+        return merged_unique, aggregated
 
     def __bool__(self) -> bool:  # pragma: no cover - convenience
         return bool(self._embeddings)

@@ -232,6 +232,9 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
         seed: int,
         include_query: bool = False,
         include_support: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        shard_across_ranks: bool = False,
     ) -> None:
         super().__init__()
         self._datasets = datasets
@@ -246,8 +249,11 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
         self._iteration = 0
         self._include_query = bool(include_query)
         self._include_support = bool(include_support)
+        self._rank = max(0, int(rank))
+        self._world_size = max(1, int(world_size))
+        self._shard_across_ranks = shard_across_ranks and self._world_size > 1
 
-    def __iter__(self) -> Iterator[PuzzleEmbeddingSample]:
+    def _iter_samples(self) -> Iterator[PuzzleEmbeddingSample]:
         if not self._shuffle:
             for split_name, dataset in self._datasets:
                 for episode in dataset:
@@ -279,7 +285,6 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
                             yield query_sample
             return
 
-        # Shuffle with reservoir buffer
         buffer_size = self._shuffle_buffer or 256
         random_seed = self._seed + self._iteration
         self._iteration += 1
@@ -325,6 +330,20 @@ class PuzzleEmbeddingIterableDataset(IterableDataset):
         while buffer:
             idx = rng.randrange(len(buffer))
             yield buffer.pop(idx)
+
+    def __iter__(self) -> Iterator[PuzzleEmbeddingSample]:
+        iterator = self._iter_samples()
+        if not self._shard_across_ranks:
+            yield from iterator
+            return
+
+        shard_buffer: List[PuzzleEmbeddingSample] = []
+        for sample in iterator:
+            shard_buffer.append(sample)
+            if len(shard_buffer) == self._world_size:
+                yield shard_buffer[self._rank]
+                shard_buffer.clear()
+        shard_buffer.clear()
 
 
 def build_puzzle_embedding_collate_fn(
