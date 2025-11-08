@@ -18,8 +18,10 @@ import shutil
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,35 @@ from scripts.training.optimizers import AdamATan2
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def init_distributed_from_env() -> Tuple[bool, int, int, Optional[int]]:
+    """Initialise torch.distributed when torchrun-provided environment variables are present."""
+
+    if not dist.is_available():
+        return False, 0, 1, None
+
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    if local_rank_env is None:
+        return False, 0, 1, None
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(local_rank_env)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return True, rank, world_size, local_rank
+
+
+def unwrap_distributed_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying module if wrapped in DistributedDataParallel."""
+
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 @dataclass(frozen=True)
@@ -176,6 +207,9 @@ class EpisodeSequenceDataset(IterableDataset):
         shuffle: bool = False,
         shuffle_buffer: Optional[int] = None,
         seed: Optional[int] = None,
+        shard_across_ranks: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         super().__init__()
         self._dataset = dataset
@@ -189,8 +223,11 @@ class EpisodeSequenceDataset(IterableDataset):
         )
         self._shuffle_seed = seed
         self._shuffle_iter = 0
+        self._shard_across_ranks = shard_across_ranks and int(world_size) > 1
+        self._rank = max(0, int(rank))
+        self._world_size = max(1, int(world_size))
 
-    def __iter__(self) -> Iterator[EpisodeSequenceSample]:
+    def _iter_samples(self) -> Iterator[EpisodeSequenceSample]:
         if not self._shuffle:
             for episode in self._dataset:
                 sample = flatten_episode(
@@ -229,6 +266,20 @@ class EpisodeSequenceDataset(IterableDataset):
         while buffer:
             index = rng.randrange(len(buffer))
             yield buffer.pop(index)
+
+    def __iter__(self) -> Iterator[EpisodeSequenceSample]:
+        iterator = self._iter_samples()
+        if not self._shard_across_ranks:
+            yield from iterator
+            return
+
+        shard_buffer: List[EpisodeSequenceSample] = []
+        for sample in iterator:
+            shard_buffer.append(sample)
+            if len(shard_buffer) == self._world_size:
+                yield shard_buffer[self._rank]
+                shard_buffer.clear()
+        shard_buffer.clear()
 
 
 def build_collate_fn(
@@ -948,6 +999,9 @@ def make_episode_dataloader(
     batch_size: int,
     ignore_index: int,
     shuffle: Optional[bool] = None,
+    rank: int = 0,
+    world_size: int = 1,
+    shard_across_ranks: bool = False,
 ) -> DataLoader:
     """Construct a DataLoader streaming flattened episode sequences."""
 
@@ -969,6 +1023,9 @@ def make_episode_dataloader(
         shuffle=shuffle_enabled,
         shuffle_buffer=shuffle_buffer,
         seed=int(cfg.seed),
+        shard_across_ranks=shard_across_ranks,
+        rank=rank,
+        world_size=world_size,
     )
     collate_fn = build_collate_fn(
         tokens,
@@ -1281,9 +1338,15 @@ def run(cfg: DictConfig) -> None:
     LOGGER.info("Original project directory: %s", get_original_cwd())
     LOGGER.info("Configuration:\n%s", OmegaConf.to_yaml(cfg))
 
-    set_all_seeds(int(cfg.seed))
+    is_distributed, rank, world_size, local_rank = init_distributed_from_env()
+    should_log = (rank == 0)
+    base_seed = int(cfg.seed)
+    set_all_seeds(base_seed + (rank if is_distributed else 0))
 
-    wandb_run, wandb_module = init_wandb(cfg)
+    if should_log:
+        wandb_run, wandb_module = init_wandb(cfg)
+    else:
+        wandb_run, wandb_module = None, None
     logging_cfg = cfg.get("logging", None)
     wandb_cfg = logging_cfg.get("wandb", None) if logging_cfg else None
 
@@ -1300,7 +1363,7 @@ def run(cfg: DictConfig) -> None:
     ignore_index = int(cfg.loss.ignore_index)
 
     augmentation_settings = resolve_augmentation_settings(cfg, tokens)
-    seed = int(cfg.seed)
+    seed = base_seed
 
     train_split = str(cfg.dataset.train_split)
     train_dataset = instantiate_episode_dataset(
@@ -1316,6 +1379,9 @@ def run(cfg: DictConfig) -> None:
         batch_size=int(cfg.data.batch_size),
         ignore_index=ignore_index,
         shuffle=bool(cfg.data.shuffle),
+        rank=rank,
+        world_size=world_size,
+        shard_across_ranks=is_distributed,
     )
 
     eval_batch_size = int(cfg.eval.batch_size)
@@ -1325,47 +1391,48 @@ def run(cfg: DictConfig) -> None:
         eval_split_cfg = cfg.dataset.eval_split
     eval_split_names = normalize_split_config(eval_split_cfg)
     eval_loaders: Dict[str, DataLoader] = {}
-    for split_name in eval_split_names:
-        eval_dataset = instantiate_episode_dataset(
-            cfg,
-            split_name,
-            seed=seed,
-            augmentation=None,
-        )
-        eval_loaders[split_name] = make_episode_dataloader(
-            dataset=eval_dataset,
-            tokens=tokens,
-            cfg=cfg,
-            batch_size=eval_batch_size,
-            ignore_index=ignore_index,
-            shuffle=False,
-        )
-
-    train_eval_split_cfg = cfg.dataset.get("train_eval_splits", None)
-    train_eval_split_names = normalize_split_config(train_eval_split_cfg)
-    for split_name in train_eval_split_names:
-        if split_name in eval_loaders:
-            continue
-        try:
+    if should_log:
+        for split_name in eval_split_names:
             eval_dataset = instantiate_episode_dataset(
                 cfg,
                 split_name,
                 seed=seed,
                 augmentation=None,
             )
-        except Exception as exc:  # pragma: no cover - dataset availability depends on external data
-            LOGGER.warning(
-                "Skipping train evaluation split '%s' due to error: %s", split_name, exc
+            eval_loaders[split_name] = make_episode_dataloader(
+                dataset=eval_dataset,
+                tokens=tokens,
+                cfg=cfg,
+                batch_size=eval_batch_size,
+                ignore_index=ignore_index,
+                shuffle=False,
             )
-            continue
-        eval_loaders[split_name] = make_episode_dataloader(
-            dataset=eval_dataset,
-            tokens=tokens,
-            cfg=cfg,
-            batch_size=eval_batch_size,
-            ignore_index=ignore_index,
-            shuffle=False,
-        )
+
+        train_eval_split_cfg = cfg.dataset.get("train_eval_splits", None)
+        train_eval_split_names = normalize_split_config(train_eval_split_cfg)
+        for split_name in train_eval_split_names:
+            if split_name in eval_loaders:
+                continue
+            try:
+                eval_dataset = instantiate_episode_dataset(
+                    cfg,
+                    split_name,
+                    seed=seed,
+                    augmentation=None,
+                )
+            except Exception as exc:  # pragma: no cover - dataset availability depends on external data
+                LOGGER.warning(
+                    "Skipping train evaluation split '%s' due to error: %s", split_name, exc
+                )
+                continue
+            eval_loaders[split_name] = make_episode_dataloader(
+                dataset=eval_dataset,
+                tokens=tokens,
+                cfg=cfg,
+                batch_size=eval_batch_size,
+                ignore_index=ignore_index,
+                shuffle=False,
+            )
 
     test_cfg = cfg.get("test", None)
     test_split_cfg = cfg.dataset.get("test_splits", None)
@@ -1374,7 +1441,7 @@ def run(cfg: DictConfig) -> None:
     test_split_names = normalize_split_config(test_split_cfg)
     test_loaders: Dict[str, DataLoader] = {}
     test_limit = None
-    if test_cfg is not None and test_split_names:
+    if should_log and test_cfg is not None and test_split_names:
         test_batch_size = int(test_cfg.get("batch_size", cfg.eval.batch_size))
         for split_name in test_split_names:
             test_dataset = instantiate_episode_dataset(
@@ -1395,9 +1462,22 @@ def run(cfg: DictConfig) -> None:
             test_limit = int(test_cfg.get("limit"))
 
     model, device = prepare_baseline_model(cfg, tokens)
+    if is_distributed:
+        if local_rank is None:
+            raise RuntimeError("LOCAL_RANK must be provided for distributed in-context training.")
+        device = torch.device("cuda", local_rank)
     model.to(device)
+    if is_distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            find_unused_parameters=True,
+            static_graph=False,
+        )
+    model_to_track = unwrap_distributed_model(model)
 
-    num_parameters = sum(param.numel() for param in model.parameters())
+    num_parameters = sum(param.numel() for param in model_to_track.parameters())
     LOGGER.info("Model parameter count: %d", int(num_parameters))
     if wandb_module and wandb_run:
         wandb_run.summary["model/num_parameters"] = int(num_parameters)
@@ -1408,7 +1488,7 @@ def run(cfg: DictConfig) -> None:
 
     checkpoint_manager: Optional[CheckpointManager] = None
     checkpoint_cfg = cfg.trainer.get("checkpoints", None)
-    if checkpoint_cfg and bool(checkpoint_cfg.get("enabled", False)):
+    if should_log and checkpoint_cfg and bool(checkpoint_cfg.get("enabled", False)):
         if not isinstance(model, torch.nn.Module):
             LOGGER.warning(
                 "Checkpoint saving is only supported for neural baselines. Skipping request."
@@ -1588,7 +1668,7 @@ def run(cfg: DictConfig) -> None:
                     "tokens": int(step_tokens),
                 }
 
-                if step_tokens > 0 and global_step % log_every == 0:
+                if should_log and step_tokens > 0 and global_step % log_every == 0:
                     last_train_metrics = log_training_metrics(
                         epoch=current_epoch,
                         step=global_step,
@@ -1607,7 +1687,7 @@ def run(cfg: DictConfig) -> None:
                     and global_step % eval_every == 0
                 ):
                     metrics_by_split = evaluate_splits(
-                        model,
+                        model_to_track,
                         eval_loaders,
                         device=device,
                         ignore_index=ignore_index,
@@ -1629,7 +1709,7 @@ def run(cfg: DictConfig) -> None:
                     )
                     if checkpoint_manager:
                         checkpoint_manager.record_evaluation(
-                            model=model,
+                            model=model_to_track,
                             aggregated_metrics=aggregated_metrics,
                             metrics_by_split=metrics_by_split,
                             epoch=None,
@@ -1663,7 +1743,7 @@ def run(cfg: DictConfig) -> None:
                 "tokens": int(step_tokens),
             }
 
-            if step_tokens > 0 and global_step % log_every == 0:
+            if should_log and step_tokens > 0 and global_step % log_every == 0:
                 last_train_metrics = log_training_metrics(
                     epoch=current_epoch,
                     step=global_step,
@@ -1682,7 +1762,7 @@ def run(cfg: DictConfig) -> None:
             and global_step % eval_every == 0
         ):
             metrics_by_split = evaluate_splits(
-                model,
+                model_to_track,
                 eval_loaders,
                 device=device,
                 ignore_index=ignore_index,
@@ -1704,7 +1784,7 @@ def run(cfg: DictConfig) -> None:
             )
             if checkpoint_manager:
                 checkpoint_manager.record_evaluation(
-                    model=model,
+                    model=model_to_track,
                     aggregated_metrics=aggregated_metrics,
                     metrics_by_split=metrics_by_split,
                     epoch=None,
@@ -1727,7 +1807,7 @@ def run(cfg: DictConfig) -> None:
         )
         if run_epoch_eval:
             metrics_by_split = evaluate_splits(
-                model,
+                model_to_track,
                 eval_loaders,
                 device=device,
                 ignore_index=ignore_index,
@@ -1749,7 +1829,7 @@ def run(cfg: DictConfig) -> None:
             )
             if checkpoint_manager:
                 checkpoint_manager.record_evaluation(
-                    model=model,
+                    model=model_to_track,
                     aggregated_metrics=aggregated_metrics,
                     metrics_by_split=metrics_by_split,
                     epoch=current_epoch,
@@ -1763,18 +1843,19 @@ def run(cfg: DictConfig) -> None:
             should_stop = True
 
         if checkpoint_manager:
-            checkpoint_manager.save_last(model)
+            checkpoint_manager.save_last(model_to_track)
 
         if should_stop:
             break
 
     if checkpoint_manager:
-        checkpoint_manager.save_last(model)
+        checkpoint_manager.save_last(model_to_track)
 
     if (
         last_step_stats
         and int(last_step_stats["tokens"]) > 0
         and int(last_step_stats["step"]) != last_logged_step
+        and should_log
     ):
         last_train_metrics = log_training_metrics(
             epoch=int(last_step_stats["epoch"]),
@@ -1791,7 +1872,7 @@ def run(cfg: DictConfig) -> None:
 
     restored_checkpoint_path: Optional[Path] = None
     if checkpoint_manager:
-        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model)
+        restored_checkpoint_path = checkpoint_manager.load_best_checkpoint(model_to_track)
         if restored_checkpoint_path is None:
             LOGGER.info(
                 "Proceeding with in-memory model parameters for test evaluation (no saved checkpoint)."
@@ -1801,7 +1882,7 @@ def run(cfg: DictConfig) -> None:
     test_aggregated_metrics: Dict[str, float] = {}
     if test_loaders:
         test_metrics_by_split = evaluate_splits(
-            model,
+            model_to_track,
             test_loaders,
             device=device,
             ignore_index=ignore_index,
@@ -1847,6 +1928,10 @@ def run(cfg: DictConfig) -> None:
             wandb_run.summary[f"test/{split_name}/loss"] = metrics.get("loss")
             wandb_run.summary[f"test/{split_name}/accuracy"] = metrics.get("accuracy")
         wandb_run.finish()
+
+    if is_distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @hydra.main(config_path="../configs", config_name="train/default", version_base=None)

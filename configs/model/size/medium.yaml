@@ -50,7 +50,7 @@ variants:
     pos_encodings: rope
     forward_dtype: bfloat16
     mlp_t: false
-    puzzle_emb_len: 12
+    puzzle_emb_len: 1 # decreased from original 16 to make it apples to apples with HRM and Transformer ACT
     no_ACT_continue: true
   hrm:
     name: recursive_reasoning.hrm@HierarchicalReasoningModel_ACTV1
