@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -155,6 +156,75 @@ def format_percentage(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _serialize_metrics(metrics: SplitMetrics) -> dict[str, Any]:
+    return {
+        "split": metrics.split,
+        "episodes": metrics.episodes,
+        "solved": metrics.solved,
+        "episode_accuracy": metrics.episode_accuracy,
+        "token_total": metrics.token_total,
+        "token_correct": metrics.token_correct,
+        "token_accuracy": metrics.token_accuracy,
+    }
+
+
+def _aggregate_overall(results: List[SplitMetrics]) -> dict[str, float]:
+    total_episodes = sum(m.episodes for m in results)
+    total_solved = sum(m.solved for m in results)
+    total_tokens = sum(m.token_total for m in results)
+    total_correct_tokens = sum(m.token_correct for m in results)
+
+    episode_accuracy = (total_solved / total_episodes) if total_episodes else 0.0
+    token_accuracy = (total_correct_tokens / total_tokens) if total_tokens else 0.0
+
+    return {
+        "episodes": total_episodes,
+        "solved": total_solved,
+        "episode_accuracy": episode_accuracy,
+        "token_total": total_tokens,
+        "token_correct": total_correct_tokens,
+        "token_accuracy": token_accuracy,
+    }
+
+
+def _resolve_results_path(cfg: DictConfig) -> Path:
+    configured = getattr(cfg.eval, "results_json_path", None)
+    if configured:
+        path = Path(to_absolute_path(str(configured)))
+    else:
+        default_dir = REPO_ROOT / "outputs" / "symbolic"
+        path = default_dir / f"{cfg.baseline.name}_results.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _build_results_payload(
+    cfg: DictConfig,
+    results: List[SplitMetrics],
+    overall: dict[str, float],
+) -> dict[str, Any]:
+    baseline_section: dict[str, Any] = {"name": cfg.baseline.name}
+    if "kwargs" in cfg.baseline:
+        baseline_kwargs = OmegaConf.to_container(cfg.baseline.kwargs, resolve=True)
+        if baseline_kwargs:
+            baseline_section["kwargs"] = baseline_kwargs
+
+    payload = {
+        "baseline": baseline_section,
+        "benchmark": cfg.dataset.benchmark,
+        "splits": [_serialize_metrics(m) for m in results],
+        "overall": overall,
+        "max_episodes": cfg.eval.max_episodes,
+    }
+    return payload
+
+
+def _write_results_json(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
 @hydra.main(config_path="../configs/symbolic", config_name="default", version_base=None)
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(level=getattr(logging, str(cfg.logging.level).upper(), logging.INFO))
@@ -184,13 +254,7 @@ def main(cfg: DictConfig) -> None:
             format_percentage(metrics.token_accuracy),
         )
 
-    total_episodes = sum(m.episodes for m in results)
-    total_solved = sum(m.solved for m in results)
-    total_tokens = sum(m.token_total for m in results)
-    total_correct_tokens = sum(m.token_correct for m in results)
-
-    overall_episode_accuracy = (total_solved / total_episodes) if total_episodes else 0.0
-    overall_token_accuracy = (total_correct_tokens / total_tokens) if total_tokens else 0.0
+    overall_summary = _aggregate_overall(results)
 
     LOGGER.info("=== Summary ===")
     for metrics in results:
@@ -205,11 +269,17 @@ def main(cfg: DictConfig) -> None:
 
     LOGGER.info(
         "Overall: solved %s/%s episodes (%s), token accuracy %s",
-        total_solved,
-        total_episodes,
-        format_percentage(overall_episode_accuracy),
-        format_percentage(overall_token_accuracy),
+        overall_summary["solved"],
+        overall_summary["episodes"],
+        format_percentage(overall_summary["episode_accuracy"]),
+        format_percentage(overall_summary["token_accuracy"]),
     )
+
+    results_path = _resolve_results_path(cfg)
+    payload = _build_results_payload(cfg, results, overall_summary)
+    _write_results_json(results_path, payload)
+    LOGGER.info("Wrote metrics JSON to %s", results_path)
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

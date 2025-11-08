@@ -9,6 +9,7 @@ declare -a SYMBOLIC_BASELINES=(
   "copycat"
   "most_frequent"
   "de_bruijn"
+  "random"
 )
 
 for baseline in "${SYMBOLIC_BASELINES[@]}"; do

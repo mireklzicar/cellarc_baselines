@@ -20,6 +20,7 @@ splits:
 eval:
   max_episodes: null
   progress_bar: true
+  results_json_path: null
 
 logging:
   level: info
