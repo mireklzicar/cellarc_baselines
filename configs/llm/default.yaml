@@ -1,0 +1,59 @@
+# @package _global_
+defaults:
+  - _self_
+
+llm:
+  model: gpt-5.0-mini
+  temperature: null
+  top_p: null
+  max_output_tokens: 256
+  reasoning_effort: null
+  api_style: responses
+  api_key_env: OPENAI_API_KEY
+  base_url: null
+  organization: null
+  request_timeout: 60.0
+  max_retries: 2
+  retry_backoff: 2.0
+  stream: false
+  use_async: false
+
+prompt:
+  instructions_path: baselines/llm/prompts/prompt_example.md
+  system_message: >
+    You are a careful assistant that solves Cellular ARC tasks by analyzing the
+    provided 1D examples and applying the inferred rule to the test input. Think
+    through the mapping but return only the final answer.
+  response_format_hint: >
+    Respond only with the predicted output sequence as space-separated integers
+    (e.g., `3 1 2 0 1`).
+  max_train_examples: 8
+  include_episode_id: false
+
+parser:
+  clip_to_expected: true
+  allow_partial: true
+
+dataset:
+  benchmark: cellarc_100k
+  include_metadata: false
+  root: null
+
+splits:
+  - test_interpolation
+  - test_extrapolation
+
+eval:
+  max_episodes: null
+  progress_bar: true
+  log_every_n: 50
+  prediction_log: null
+  num_workers: 1
+  async_concurrency: 4
+
+logging:
+  level: info
+
+hydra:
+  job:
+    chdir: false
