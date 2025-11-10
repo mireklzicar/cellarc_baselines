@@ -5,6 +5,9 @@ defaults:
 
 seed: 1337
 
+training:
+  mode: incontext
+
 dataset:
   benchmark: cellarc_100k
   train_split: train
@@ -61,12 +64,33 @@ trainer:
     enabled: false
     overwrite: false
 
+recursive_trainer:
+  lr: 1.0e-4
+  lr_min_ratio: 1.0
+  lr_warmup_steps: 2000
+  lr_cycles: 0.5
+  weight_decay: 0.0
+  puzzle_emb_lr: 1.0e-2
+  puzzle_emb_weight_decay: 0.0
+  use_ema: false
+  ema_decay: 0.999
+  beta1: 0.9
+  beta2: 0.999
+  gradient_accumulation: ${trainer.gradient_accumulation}
+
 loss:
   ignore_index: -100
 
 eval:
   batch_size: 64
   limit: null
+  tta:
+    enabled: false
+    num_augs: 16
+    use_palette: true
+    use_reverse: true
+    vote: "majority"
+    apply_to: "query_only"
 
 test:
   batch_size: 64

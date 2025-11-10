@@ -26,6 +26,7 @@ DEFAULT_INPUT_VOCAB_SIZE = 17
 DEFAULT_OUTPUT_VOCAB_SIZE = 17
 DEFAULT_MAX_SEQ_LEN = 272
 DEFAULT_BATCH_SIZE = 64
+DEFAULT_PAD_TOKEN_ID = 10
 
 
 def load_size_variants(size_name: str) -> Mapping[str, Mapping[str, Any]]:
@@ -78,6 +79,7 @@ def count_parameters_for_architecture(
         device=torch.device("cpu"),
         dtype=torch.float32,
         model_kwargs=model_kwargs,
+        pad_token_id=DEFAULT_PAD_TOKEN_ID,
     )
     model = create_baseline(architecture, baseline_config)
     try:

@@ -3,12 +3,22 @@ size: medium
 variants:
   rnn:
     hidden_size: 512
+  rnn_ar:
+    hidden_size: 256
+    teacher_forcing: true
   transformer:
+    embedding_dim: 256
+    num_layers: 2
+    num_heads: 8
+    dropout_prob: 0.1
+    widening_factor: 2
+  transformer_ar:
     embedding_dim: 160
     num_layers: 2
     num_heads: 5
     dropout_prob: 0.1
     widening_factor: 2
+    teacher_forcing: true
   cnn1d:
     embedding_dim: 160
     hidden_channels: 320
@@ -40,7 +50,7 @@ variants:
     pos_encodings: rope
     forward_dtype: bfloat16
     mlp_t: false
-    puzzle_emb_len: 12
+    puzzle_emb_len: 1 # decreased from original 16 to make it apples to apples with HRM and Transformer ACT
     no_ACT_continue: true
   hrm:
     name: recursive_reasoning.hrm@HierarchicalReasoningModel_ACTV1
@@ -60,3 +70,18 @@ variants:
     pos_encodings: rope
     forward_dtype: bfloat16
     mlp_t: false
+  transformer_act:
+    name: recursive_reasoning.transformers_baseline@Model_ACTV2
+    loss:
+      name: losses@ACTLossHead
+      loss_type: stablemax_cross_entropy
+    halt_exploration_prob: 0.1
+    halt_max_steps: 16
+    H_cycles: 1
+    H_layers: 4
+    hidden_size: 160
+    num_heads: 4
+    expansion: 2.0
+    puzzle_emb_ndim: ${.hidden_size}
+    pos_encodings: rope
+    forward_dtype: bfloat16

@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Protocol
 from .copycat import CopycatSolver
 from .de_bruijn_solver import DeBruijnSolver
 from .most_frequent import MostFrequentSolver
+from .random import RandomSolver
 
 
 class SymbolicSolver(Protocol):
@@ -22,6 +23,7 @@ _SYMBOLIC_BASELINES: dict[str, SymbolicSolverFactory] = {
     "copycat": CopycatSolver,
     "most_frequent": MostFrequentSolver,
     "de_bruijn": DeBruijnSolver,
+    "random": RandomSolver,
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ __all__ = [
     "CopycatSolver",
     "DeBruijnSolver",
     "MostFrequentSolver",
+    "RandomSolver",
     "SymbolicSolver",
     "SymbolicSolverFactory",
     "create_symbolic_baseline",

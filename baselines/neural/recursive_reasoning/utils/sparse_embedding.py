@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -12,6 +12,9 @@ class CastedSparseEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, batch_size: int, init_std: float, cast_to: torch.dtype):
         super().__init__()
         self.cast_to = cast_to
+        self._local_grad: Optional[torch.Tensor] = None
+        self._active_rows: int = 0
+        self._embedding_dim = embedding_dim
 
         # Real Weights
         # Truncated LeCun normal init
@@ -21,7 +24,9 @@ class CastedSparseEmbedding(nn.Module):
 
         # Local weights and IDs
         # Local embeddings, with gradient, not persistent
-        self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
+        self.local_weights = nn.Buffer(
+            torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False
+        )
         # Local embedding IDs, not persistent
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
 
@@ -29,13 +34,72 @@ class CastedSparseEmbedding(nn.Module):
         if not self.training:
             # Test mode, no gradient
             return self.weights[inputs].to(self.cast_to)
-            
-        # Training mode, fill puzzle embedding from weights
-        with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
+        
+        # Ensure tensor dtypes for indexing and capture original layout
+        original_shape = inputs.shape
+        flat_inputs = inputs.reshape(-1).to(device=self.weights.device, dtype=torch.long)
+        current_batch = flat_inputs.shape[0]
 
-        return self.local_weights.to(self.cast_to)
+        if current_batch == 0:
+            self._active_rows = 0
+            self._local_grad = None
+            return self.local_weights[:0].to(self.cast_to).reshape(*original_shape, self._embedding_dim)
+
+        # Expand local buffers if the current batch exceeds the preallocated capacity
+        if current_batch > self.local_weights.shape[0]:
+            new_local_weights = torch.zeros(
+                (current_batch, self._embedding_dim),
+                dtype=self.local_weights.dtype,
+                device=self.local_weights.device,
+                requires_grad=True,
+            )
+            new_local_ids = torch.zeros(
+                current_batch,
+                dtype=self.local_ids.dtype,
+                device=self.local_ids.device,
+            )
+            if self.local_weights.numel() > 0:
+                new_local_weights[: self.local_weights.shape[0]].copy_(self.local_weights)
+                new_local_ids[: self.local_ids.shape[0]].copy_(self.local_ids)
+            self.register_buffer("local_weights", new_local_weights, persistent=False)
+            self.register_buffer("local_ids", new_local_ids, persistent=False)
+
+        # Populate the active slice with the embedding weights for the current ids
+        with torch.no_grad():
+            gathered = self.weights[flat_inputs].view(current_batch, self._embedding_dim)
+            self.local_weights[:current_batch].copy_(gathered)
+            self.local_ids[:current_batch].copy_(flat_inputs.to(self.local_ids.dtype))
+
+        self._active_rows = current_batch
+        self._local_grad = None
+
+        local_output = self.local_weights[:current_batch].to(self.cast_to)
+        output = local_output.reshape(*original_shape, self._embedding_dim)
+
+        if not torch.is_grad_enabled():
+            return output
+
+        if not output.requires_grad:
+            output = output.detach().requires_grad_(True)
+
+        def _store_local_grad(grad: torch.Tensor) -> torch.Tensor:
+            self._local_grad = grad.reshape(current_batch, self._embedding_dim).to(self.weights.dtype)
+            return grad
+
+        output.register_hook(_store_local_grad)
+        return output
+
+    @property
+    def local_grad(self) -> Optional[torch.Tensor]:
+        return self._local_grad
+
+    def clear_local_grad(self) -> None:
+        self._local_grad = None
+        self._active_rows = 0
+
+    @property
+    def active_rows(self) -> int:
+        return self._active_rows
 
 
 class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):

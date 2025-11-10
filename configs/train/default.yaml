@@ -5,6 +5,9 @@ defaults:
 
 seed: 1337
 
+training:
+  mode: incontext
+
 dataset:
   benchmark: cellarc_100k
   train_split: train
@@ -15,12 +18,12 @@ dataset:
   root: null
 
 data:
-  batch_size: 64
+  batch_size: 768
   num_workers: 0
   max_seq_len: 272
   drop_long_episodes: false
   shuffle: true
-  shuffle_buffer: 1024
+  shuffle_buffer: 7680
   augmentation:
     enabled: true
     reverse_prob: 0.5
@@ -43,14 +46,28 @@ model:
 
 optimizer:
   name: adamw
-  lr: 0.0005
+  lr: 0.0001
   weight_decay: 0.0
   betas: [0.9, 0.999]
   eps: 1e-8
   warmup_steps: 0
 
+recursive_trainer:
+  lr: 0.0001
+  lr_min_ratio: 1.0
+  lr_warmup_steps: 1000
+  lr_cycles: 0.5
+  weight_decay: 0.0
+  puzzle_emb_lr: 1.0e-2
+  puzzle_emb_weight_decay: 0.0
+  use_ema: false
+  ema_decay: 0.999
+  beta1: 0.9
+  beta2: 0.999
+  gradient_accumulation: ${trainer.gradient_accumulation}
+
 trainer:
-  num_epochs: 10
+  num_epochs: 50
   max_steps: null
   eval_every: null
   log_every: 50
@@ -65,11 +82,18 @@ loss:
   ignore_index: -100
 
 eval:
-  batch_size: 64
+  batch_size: 768
   limit: null
+  tta:
+    enabled: false
+    num_augs: 16
+    use_palette: true
+    use_reverse: true
+    vote: "majority"
+    apply_to: "query_only"
 
 test:
-  batch_size: 64
+  batch_size: 768
   limit: null
 
 logging:

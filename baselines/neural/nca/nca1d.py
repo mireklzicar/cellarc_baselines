@@ -22,12 +22,20 @@ class NCA1DSeq2Seq(nn.Module):
         cell_dropout_rate: float = 0.1,
         input_embedding_dim: int = 32,
         use_layer_norm: bool = True,
+        puzzle_emb_ndim: int = 0,
+        num_puzzle_identifiers: int = 0,
+        puzzle_emb_init_std: float = 0.02,
+        puzzle_proj_init_std: float = 0.02,
     ) -> None:
         super().__init__()
         if kernel_size % 2 != 1:
             raise ValueError("kernel_size must be odd to preserve the sequence length.")
 
         self.requires_targets = False
+        puzzle_emb_ndim = int(puzzle_emb_ndim)
+        num_puzzle_identifiers = int(num_puzzle_identifiers)
+        puzzle_emb_init_std = float(puzzle_emb_init_std)
+        puzzle_proj_init_std = float(puzzle_proj_init_std)
         self.channel_size = int(channel_size)
         self.num_kernels = int(num_kernels)
         self.hidden_size = int(hidden_size)
@@ -41,6 +49,24 @@ class NCA1DSeq2Seq(nn.Module):
 
         self.token_embed = nn.Embedding(vocab_size, embedding_dim)
         self.state_encoder = nn.Linear(embedding_dim, self.channel_size)
+
+        self.puzzle_embedding: Optional[nn.Embedding] = None
+        self.puzzle_projector: Optional[nn.Linear] = None
+        if puzzle_emb_ndim > 0 and num_puzzle_identifiers > 0:
+            self.puzzle_embedding = nn.Embedding(
+                num_puzzle_identifiers, puzzle_emb_ndim
+            )
+            nn.init.trunc_normal_(self.puzzle_embedding.weight, std=puzzle_emb_init_std)
+            self.puzzle_projector = nn.Linear(
+                puzzle_emb_ndim,
+                embedding_dim,
+                bias=True,
+            )
+            nn.init.trunc_normal_(self.puzzle_projector.weight, std=puzzle_proj_init_std)
+            if self.puzzle_projector.bias is not None:
+                nn.init.zeros_(self.puzzle_projector.bias)
+
+        self.requires_puzzle_identifiers = self.puzzle_embedding is not None
 
         padding = self.kernel_size // 2
         self.perceive = nn.Conv1d(
@@ -114,6 +140,8 @@ class NCA1DSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
 
@@ -121,6 +149,15 @@ class NCA1DSeq2Seq(nn.Module):
             inputs = inputs.long()
 
         state = self.token_embed(inputs)
+        if self.puzzle_embedding is not None and self.puzzle_projector is not None:
+            if puzzle_identifiers is None:
+                raise ValueError(
+                    "NCA1DSeq2Seq expects puzzle identifiers when puzzle embeddings are enabled."
+                )
+            puzzle_identifiers = puzzle_identifiers.to(inputs.device)
+            puzzle_vectors = self.puzzle_embedding(puzzle_identifiers)
+            puzzle_bias = self.puzzle_projector(puzzle_vectors).to(state.dtype)
+            state = state + puzzle_bias.unsqueeze(1)
         state = self.state_encoder(state).transpose(1, 2)  # (B, C, L)
 
         for _ in range(self.num_steps):

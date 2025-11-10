@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, List
 
 import torch
 import torch.nn.functional as F
@@ -15,9 +15,8 @@ from .neural.recursive_reasoning import (
 )
 from .neural.nca.nca1d import NCA1DSeq2Seq
 from .neural.rnn.rnn import RNNModel
-from .neural.rnn.stack_rnn import StackRNNCore
-from .neural.rnn.tape_rnn import TapeInputLengthJumpCore
-from .neural.transformer import make_transformer
+
+from .neural.transformer import make_transformer, make_transformer_encoder
 
 
 @dataclass
@@ -31,6 +30,7 @@ class BaselineConfig:
     device: torch.device | str = "cpu"
     dtype: torch.dtype = torch.float32
     model_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    pad_token_id: Optional[int] = None
 
 
 class RNNSeq2Seq(nn.Module):
@@ -48,6 +48,28 @@ class RNNSeq2Seq(nn.Module):
         super().__init__()
         self.input_vocab_size = config.input_vocab_size
         self.output_vocab_size = config.output_vocab_size
+
+        puzzle_emb_ndim = int(rnn_kwargs.pop("puzzle_emb_ndim", 0))
+        num_puzzle_identifiers = int(rnn_kwargs.pop("num_puzzle_identifiers", 0))
+        puzzle_emb_init_std = float(rnn_kwargs.pop("puzzle_emb_init_std", 0.02))
+        puzzle_proj_init_std = float(rnn_kwargs.pop("puzzle_proj_init_std", 0.02))
+
+        self.puzzle_embedding: Optional[nn.Embedding] = None
+        self.puzzle_projector: Optional[nn.Linear] = None
+        if puzzle_emb_ndim > 0 and num_puzzle_identifiers > 0:
+            self.puzzle_embedding = nn.Embedding(
+                num_puzzle_identifiers, puzzle_emb_ndim
+            )
+            nn.init.trunc_normal_(self.puzzle_embedding.weight, std=puzzle_emb_init_std)
+            self.puzzle_projector = nn.Linear(
+                puzzle_emb_ndim,
+                self.input_vocab_size,
+                bias=True,
+            )
+            nn.init.trunc_normal_(self.puzzle_projector.weight, std=puzzle_proj_init_std)
+            if self.puzzle_projector.bias is not None:
+                nn.init.zeros_(self.puzzle_projector.bias)
+
         self.model = RNNModel(
             output_size=config.output_vocab_size,
             rnn_core="lstm",
@@ -57,21 +79,194 @@ class RNNSeq2Seq(nn.Module):
             hidden_size=hidden_size,
             **rnn_kwargs,
         )
+        self.requires_puzzle_identifiers = self.puzzle_embedding is not None
         self.requires_targets = False
 
     def forward(
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
+        del loss_mask  # unused
         one_hot = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
+        if self.puzzle_embedding is not None and self.puzzle_projector is not None:
+            if puzzle_identifiers is None:
+                raise ValueError(
+                    "RNNSeq2Seq expects puzzle identifiers when puzzle embeddings are enabled."
+                )
+            puzzle_identifiers = puzzle_identifiers.to(inputs.device)
+            puzzle_vectors = self.puzzle_embedding(puzzle_identifiers)
+            puzzle_bias = self.puzzle_projector(puzzle_vectors).to(one_hot.dtype)
+            one_hot = one_hot + puzzle_bias.unsqueeze(1)
         logits = self.model(one_hot, input_length=inputs.size(1))
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         return logits
 
 
+class RNNSeq2SeqAutoregressive(nn.Module):
+    """Seq2seq LSTM baseline with teacher forcing during training and autoregressive decoding."""
+
+    def __init__(
+        self,
+        config: BaselineConfig,
+        **model_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.input_vocab_size = config.input_vocab_size
+        self.output_vocab_size = config.output_vocab_size
+        hidden_size = int(model_kwargs.pop("hidden_size", 128))
+        num_layers = max(1, int(model_kwargs.pop("num_layers", 1)))
+        self.teacher_forcing = bool(model_kwargs.pop("teacher_forcing", True))
+
+        puzzle_emb_ndim = int(model_kwargs.pop("puzzle_emb_ndim", 0))
+        num_puzzle_identifiers = int(model_kwargs.pop("num_puzzle_identifiers", 0))
+        puzzle_emb_init_std = float(model_kwargs.pop("puzzle_emb_init_std", 0.02))
+        puzzle_proj_init_std = float(model_kwargs.pop("puzzle_proj_init_std", 0.02))
+
+        self.puzzle_embedding: Optional[nn.Embedding] = None
+        self.puzzle_projector: Optional[nn.Linear] = None
+        if puzzle_emb_ndim > 0 and num_puzzle_identifiers > 0:
+            self.puzzle_embedding = nn.Embedding(
+                num_puzzle_identifiers, puzzle_emb_ndim
+            )
+            nn.init.trunc_normal_(self.puzzle_embedding.weight, std=puzzle_emb_init_std)
+            self.puzzle_projector = nn.Linear(
+                puzzle_emb_ndim,
+                hidden_size,
+                bias=True,
+            )
+            nn.init.trunc_normal_(self.puzzle_projector.weight, std=puzzle_proj_init_std)
+            if self.puzzle_projector.bias is not None:
+                nn.init.zeros_(self.puzzle_projector.bias)
+
+        self.input_embedding = nn.Embedding(self.input_vocab_size, hidden_size)
+        self.output_embedding = nn.Embedding(self.output_vocab_size + 1, hidden_size)
+        self.encoder = nn.LSTM(
+            hidden_size,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.decoder = nn.LSTM(
+            hidden_size,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.output_layer = nn.Linear(hidden_size, self.output_vocab_size)
+
+        self.start_token_id = self.output_vocab_size
+        self.requires_puzzle_identifiers = self.puzzle_embedding is not None
+        self.requires_targets = bool(self.teacher_forcing)
+        self.accepts_loss_mask = True
+
+    def train(self, mode: bool = True) -> "RNNSeq2SeqAutoregressive":
+        super().train(mode)
+        if self.teacher_forcing:
+            self.requires_targets = mode
+        else:
+            self.requires_targets = False
+        return self
+
+    def _apply_puzzle_bias(
+        self,
+        embeddings: torch.Tensor,
+        puzzle_identifiers: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.puzzle_embedding is None or self.puzzle_projector is None:
+            return embeddings
+        if puzzle_identifiers is None:
+            raise ValueError(
+                "RNNSeq2SeqAutoregressive expects puzzle identifiers when puzzle embeddings are enabled."
+            )
+        puzzle_vectors = self.puzzle_embedding(puzzle_identifiers)
+        puzzle_bias = self.puzzle_projector(puzzle_vectors).to(embeddings.dtype)
+        return embeddings + puzzle_bias.unsqueeze(1)
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        device = inputs.device
+        if puzzle_identifiers is not None:
+            puzzle_identifiers = puzzle_identifiers.to(device)
+
+        encoder_inputs = self.input_embedding(inputs.to(device))
+        encoder_inputs = self._apply_puzzle_bias(encoder_inputs, puzzle_identifiers)
+        _, encoder_state = self.encoder(encoder_inputs)
+
+        if self.teacher_forcing and self.training:
+            if targets is None:
+                raise ValueError(
+                    "RNNSeq2SeqAutoregressive requires targets for teacher forcing during training."
+                )
+            target_tokens = torch.clamp(targets.to(device), min=0)
+            start_token = torch.full(
+                (target_tokens.size(0), 1),
+                self.start_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            decoder_input_tokens = torch.cat(
+                (start_token, target_tokens[:, :-1]),
+                dim=1,
+            )
+            decoder_inputs = self.output_embedding(decoder_input_tokens)
+            decoder_outputs, _ = self.decoder(decoder_inputs, encoder_state)
+            return self.output_layer(decoder_outputs)
+
+        # Autoregressive decoding (evaluation or teacher forcing disabled).
+        if targets is not None:
+            template = torch.clamp(targets.to(device), min=0).long()
+            sequence_length = template.shape[1]
+        else:
+            template = None
+            sequence_length = inputs.shape[1]
+
+        if loss_mask is None:
+            predict_mask = torch.ones(
+                (inputs.size(0), sequence_length),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            predict_mask = loss_mask.to(device=device, dtype=torch.bool)
+
+        hidden_state = encoder_state
+        next_token = torch.full(
+            (inputs.size(0), 1),
+            self.start_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        logits_per_step: List[torch.Tensor] = []
+
+        for t in range(sequence_length):
+            decoder_input = self.output_embedding(next_token)
+            decoder_output, hidden_state = self.decoder(decoder_input, hidden_state)
+            step_logits = self.output_layer(decoder_output[:, -1, :])
+            logits_per_step.append(step_logits.unsqueeze(1))
+
+            step_pred = step_logits.argmax(dim=-1)
+            if template is not None:
+                template_tokens = template[:, t]
+                step_pred = torch.where(
+                    predict_mask[:, t],
+                    step_pred,
+                    template_tokens,
+                )
+            next_token = step_pred.unsqueeze(1)
+
+        return torch.cat(logits_per_step, dim=1)
 class TransformerSeq2Seq(nn.Module):
     """Transformer seq2seq baseline with teacher forcing."""
 
@@ -83,9 +278,33 @@ class TransformerSeq2Seq(nn.Module):
         super().__init__()
         self.input_vocab_size = config.input_vocab_size
         self.output_vocab_size = config.output_vocab_size
+
         embedding_dim = int(model_kwargs.pop("embedding_dim", 128))
         num_layers = int(model_kwargs.pop("num_layers", 2))
         num_heads = int(model_kwargs.pop("num_heads", 4))
+        teacher_forcing = bool(model_kwargs.pop("teacher_forcing", True))
+        puzzle_emb_ndim = int(model_kwargs.pop("puzzle_emb_ndim", 0))
+        num_puzzle_identifiers = int(model_kwargs.pop("num_puzzle_identifiers", 0))
+        puzzle_emb_init_std = float(model_kwargs.pop("puzzle_emb_init_std", 0.02))
+        puzzle_proj_init_std = float(model_kwargs.pop("puzzle_proj_init_std", 0.02))
+
+        self.teacher_forcing = teacher_forcing
+        self.puzzle_embedding: Optional[nn.Embedding] = None
+        self.puzzle_projector: Optional[nn.Linear] = None
+        if puzzle_emb_ndim > 0 and num_puzzle_identifiers > 0:
+            self.puzzle_embedding = nn.Embedding(
+                num_puzzle_identifiers, puzzle_emb_ndim
+            )
+            nn.init.trunc_normal_(self.puzzle_embedding.weight, std=puzzle_emb_init_std)
+            self.puzzle_projector = nn.Linear(
+                puzzle_emb_ndim,
+                self.input_vocab_size,
+                bias=True,
+            )
+            nn.init.trunc_normal_(self.puzzle_projector.weight, std=puzzle_proj_init_std)
+            if self.puzzle_projector.bias is not None:
+                nn.init.zeros_(self.puzzle_projector.bias)
+
         self.model = make_transformer(
             output_size=config.output_vocab_size,
             embedding_dim=embedding_dim,
@@ -95,19 +314,177 @@ class TransformerSeq2Seq(nn.Module):
             input_size=config.input_vocab_size,
             **model_kwargs,
         )
-        self.requires_targets = True
+        self.requires_puzzle_identifiers = self.puzzle_embedding is not None
+        self.requires_targets = bool(teacher_forcing)
+        self.accepts_loss_mask = True
+
+    def train(self, mode: bool = True) -> "TransformerSeq2Seq":
+        super().train(mode)
+        if self.teacher_forcing:
+            self.requires_targets = mode
+        else:
+            self.requires_targets = False
+        return self
 
     def forward(
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if targets is None:
-            raise ValueError("TransformerSeq2Seq requires target tokens for teacher forcing.")
-        enc = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
-        tgt = torch.clamp(targets, min=0)
-        dec = F.one_hot(tgt, num_classes=self.output_vocab_size).to(torch.float32)
-        return self.model(enc, dec)
+        device = inputs.device
+        if self.puzzle_embedding is not None:
+            if puzzle_identifiers is None:
+                raise ValueError(
+                    "TransformerSeq2Seq expects puzzle identifiers when puzzle embeddings are enabled."
+                )
+            puzzle_identifiers = puzzle_identifiers.to(device)
+
+        encoder_inputs = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
+        if self.puzzle_embedding is not None and self.puzzle_projector is not None:
+            puzzle_vectors = self.puzzle_embedding(puzzle_identifiers)
+            puzzle_token = self.puzzle_projector(puzzle_vectors).to(encoder_inputs.dtype)
+            encoder_inputs = torch.cat((puzzle_token.unsqueeze(1), encoder_inputs), dim=1)
+
+        if self.teacher_forcing and self.training:
+            if targets is None:
+                raise ValueError("TransformerSeq2Seq requires target tokens for teacher forcing during training.")
+            tgt = torch.clamp(targets, min=0)
+            decoder_inputs = F.one_hot(tgt, num_classes=self.output_vocab_size).to(torch.float32)
+            return self.model(encoder_inputs, decoder_inputs)
+
+        return self._autoregressive_decode(
+            encoder_inputs=encoder_inputs,
+            targets=targets,
+            loss_mask=loss_mask,
+        )
+
+    def _autoregressive_decode(
+        self,
+        *,
+        encoder_inputs: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Greedy decoding without using ground-truth targets."""
+        device = encoder_inputs.device
+        batch_size, _, _ = encoder_inputs.shape
+        encoded = self.model.transformer._encoder(encoder_inputs)
+
+        if targets is not None:
+            template = torch.clamp(targets.to(device), min=0).long()
+        else:
+            sequence_length = encoder_inputs.shape[1]
+            template = torch.zeros(
+                (batch_size, sequence_length),
+                dtype=torch.long,
+                device=device,
+            )
+
+        if loss_mask is None:
+            predict_mask = torch.ones_like(template, dtype=torch.bool)
+        else:
+            predict_mask = loss_mask.to(device=device, dtype=torch.bool)
+
+        generated = template.clone()
+        generated[predict_mask] = 0
+
+        sequence_length = generated.shape[1]
+        for t in range(sequence_length):
+            decoder_input = F.one_hot(
+                torch.clamp(generated, min=0),
+                num_classes=self.output_vocab_size,
+            ).to(encoder_inputs.dtype)
+
+            decoder_output = self.model.transformer._decoder(encoded, decoder_input)
+            logits = self.model.linear(decoder_output)
+            update_mask = predict_mask[:, t]
+            if update_mask.any():
+                step_preds = logits[:, t, :].argmax(dim=-1)
+                generated[update_mask, t] = step_preds[update_mask]
+            elif targets is not None:
+                generated[:, t] = template[:, t]
+
+        final_decoder_input = F.one_hot(
+            torch.clamp(generated, min=0),
+            num_classes=self.output_vocab_size,
+        ).to(encoder_inputs.dtype)
+        final_decoder_output = self.model.transformer._decoder(encoded, final_decoder_input)
+        return self.model.linear(final_decoder_output)
+
+
+class TransformerEncoderSeq2Seq(nn.Module):
+    """Transformer encoder-only baseline without teacher forcing."""
+
+    def __init__(
+        self,
+        config: BaselineConfig,
+        **model_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.input_vocab_size = config.input_vocab_size
+        self.output_vocab_size = config.output_vocab_size
+
+        embedding_dim = int(model_kwargs.pop("embedding_dim", 128))
+        num_layers = int(model_kwargs.pop("num_layers", 2))
+        num_heads = int(model_kwargs.pop("num_heads", 4))
+        puzzle_emb_ndim = int(model_kwargs.pop("puzzle_emb_ndim", 0))
+        num_puzzle_identifiers = int(model_kwargs.pop("num_puzzle_identifiers", 0))
+        puzzle_emb_init_std = float(model_kwargs.pop("puzzle_emb_init_std", 0.02))
+        puzzle_proj_init_std = float(model_kwargs.pop("puzzle_proj_init_std", 0.02))
+
+        self.puzzle_embedding: Optional[nn.Embedding] = None
+        self.puzzle_projector: Optional[nn.Linear] = None
+        if puzzle_emb_ndim > 0 and num_puzzle_identifiers > 0:
+            self.puzzle_embedding = nn.Embedding(
+                num_puzzle_identifiers, puzzle_emb_ndim
+            )
+            nn.init.trunc_normal_(self.puzzle_embedding.weight, std=puzzle_emb_init_std)
+            self.puzzle_projector = nn.Linear(
+                puzzle_emb_ndim,
+                self.input_vocab_size,
+                bias=True,
+            )
+            nn.init.trunc_normal_(self.puzzle_projector.weight, std=puzzle_proj_init_std)
+            if self.puzzle_projector.bias is not None:
+                nn.init.zeros_(self.puzzle_projector.bias)
+
+        self.model = make_transformer_encoder(
+            output_size=config.output_vocab_size,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            return_all_outputs=True,
+            input_size=config.input_vocab_size,
+            **model_kwargs,
+        )
+
+        self.requires_puzzle_identifiers = self.puzzle_embedding is not None
+        self.requires_targets = False
+        self.accepts_loss_mask = False
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del targets, loss_mask  # not used
+        encoder_inputs = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
+        if self.puzzle_embedding is not None and self.puzzle_projector is not None:
+            if puzzle_identifiers is None:
+                raise ValueError(
+                    "TransformerEncoderSeq2Seq expects puzzle identifiers when puzzle embeddings are enabled."
+                )
+            puzzle_identifiers = puzzle_identifiers.to(inputs.device)
+            puzzle_vectors = self.puzzle_embedding(puzzle_identifiers)
+            puzzle_bias = self.puzzle_projector(puzzle_vectors).to(encoder_inputs.dtype)
+            encoder_inputs = encoder_inputs + puzzle_bias.unsqueeze(1)
+        return self.model(encoder_inputs)
 
 
 class TinyRecursiveSeq2Seq(nn.Module):
@@ -157,15 +534,23 @@ class TinyRecursiveSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
@@ -230,15 +615,23 @@ class HierarchicalReasoningSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
@@ -305,133 +698,27 @@ class TransformerACTSeq2Seq(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        *,
+        puzzle_identifiers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del targets  # unused
         device = self.model.inner.H_init.device
         inputs = inputs.to(device=device)
+        if puzzle_identifiers is None:
+            puzzle_identifiers = torch.zeros(
+                inputs.size(0), dtype=torch.int32, device=device
+            )
+        else:
+            puzzle_identifiers = puzzle_identifiers.to(
+                device=device, dtype=torch.int32
+            )
         batch = {
             "inputs": inputs.to(torch.int32),
-            "puzzle_identifiers": torch.zeros(
-                inputs.size(0), dtype=torch.int32, device=device
-            ),
+            "puzzle_identifiers": puzzle_identifiers,
         }
         carry = self.model.initial_carry(batch)
         _, outputs = self.model(carry, batch)
         return outputs["logits"]
-
-
-class TapeRNNSeq2Seq(nn.Module):
-    """Sequence-to-sequence wrapper for the differentiable tape RNN core."""
-
-    def __init__(
-        self,
-        config: BaselineConfig,
-        **model_kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.input_vocab_size = config.input_vocab_size
-        self.output_vocab_size = config.output_vocab_size
-
-        core_kwargs = dict(model_kwargs)
-        memory_cell_size = int(core_kwargs.pop("memory_cell_size", 128))
-        memory_size = int(core_kwargs.pop("memory_size", 32))
-        n_tapes = int(core_kwargs.pop("n_tapes", 1))
-        mlp_layers_size = core_kwargs.pop("mlp_layers_size", (64, 64))
-        if mlp_layers_size is None:
-            mlp_layers = ()
-        elif isinstance(mlp_layers_size, Sequence) and not isinstance(mlp_layers_size, (str, bytes)):
-            mlp_layers = tuple(int(layer) for layer in mlp_layers_size)
-        else:
-            mlp_layers = (int(mlp_layers_size),)
-        inner_core = str(core_kwargs.pop("inner_core", "lstm"))
-        hidden_size = int(core_kwargs.pop("hidden_size", 256))
-        input_size = int(core_kwargs.pop("input_size", config.input_vocab_size))
-        input_window = int(core_kwargs.pop("input_window", 1))
-
-        tape_core = TapeInputLengthJumpCore(
-            memory_cell_size=memory_cell_size,
-            memory_size=memory_size,
-            n_tapes=n_tapes,
-            mlp_layers_size=mlp_layers,
-            inner_core=inner_core,
-            hidden_size=hidden_size,
-            input_size=input_size,
-            **core_kwargs,
-        )
-        self.model = RNNModel(
-            output_size=config.output_vocab_size,
-            rnn_core=tape_core,
-            return_all_outputs=True,
-            input_window=input_window,
-            input_size=input_size,
-            hidden_size=hidden_size,
-        )
-        self.requires_targets = False
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        del targets  # unused
-        one_hot = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
-        logits = self.model(one_hot, input_length=inputs.size(1))
-        if logits.ndim == 2:
-            logits = logits.unsqueeze(1)
-        return logits
-
-
-class StackRNNSeq2Seq(nn.Module):
-    """Sequence-to-sequence wrapper for the differentiable stack RNN core."""
-
-    def __init__(
-        self,
-        config: BaselineConfig,
-        **model_kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.input_vocab_size = config.input_vocab_size
-        self.output_vocab_size = config.output_vocab_size
-
-        core_kwargs = dict(model_kwargs)
-        stack_cell_size = int(core_kwargs.pop("stack_cell_size", 128))
-        stack_size = int(core_kwargs.pop("stack_size", 32))
-        n_stacks = int(core_kwargs.pop("n_stacks", 1))
-        inner_core = str(core_kwargs.pop("inner_core", "lstm"))
-        hidden_size = int(core_kwargs.pop("hidden_size", 256))
-        input_size = int(core_kwargs.pop("input_size", config.input_vocab_size))
-        input_window = int(core_kwargs.pop("input_window", 1))
-
-        stack_core = StackRNNCore(
-            stack_cell_size=stack_cell_size,
-            stack_size=stack_size,
-            n_stacks=n_stacks,
-            inner_core=inner_core,
-            hidden_size=hidden_size,
-            input_size=input_size,
-            **core_kwargs,
-        )
-        self.model = RNNModel(
-            output_size=config.output_vocab_size,
-            rnn_core=stack_core,
-            return_all_outputs=True,
-            input_window=input_window,
-            input_size=input_size,
-            hidden_size=hidden_size,
-        )
-        self.requires_targets = False
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        del targets  # unused
-        one_hot = F.one_hot(inputs, num_classes=self.input_vocab_size).to(torch.float32)
-        logits = self.model(one_hot, input_length=inputs.size(1))
-        if logits.ndim == 2:
-            logits = logits.unsqueeze(1)
-        return logits
 
 
 def _build_rnn(config: BaselineConfig) -> nn.Module:
@@ -439,14 +726,23 @@ def _build_rnn(config: BaselineConfig) -> nn.Module:
 
 
 def _build_transformer(config: BaselineConfig) -> nn.Module:
-    return TransformerSeq2Seq(config, **dict(config.model_kwargs)).to(config.device, dtype=config.dtype)
+    return TransformerEncoderSeq2Seq(config, **dict(config.model_kwargs)).to(config.device, dtype=config.dtype)
+
+
+def _build_transformer_ar(config: BaselineConfig) -> nn.Module:
+    kwargs = dict(config.model_kwargs)
+    kwargs.setdefault("teacher_forcing", True)
+    return TransformerSeq2Seq(config, **kwargs).to(config.device, dtype=config.dtype)
 
 
 def _build_cnn(config: BaselineConfig) -> nn.Module:
+    model_kwargs = dict(config.model_kwargs)
+    if "pad_token_id" not in model_kwargs:
+        model_kwargs["pad_token_id"] = config.pad_token_id
     return CNN1DSeq2Seq(
         config.input_vocab_size,
         config.output_vocab_size,
-        **dict(config.model_kwargs),
+        **model_kwargs,
     ).to(config.device, dtype=config.dtype)
 
 
@@ -465,32 +761,28 @@ def _build_transformer_act(config: BaselineConfig) -> nn.Module:
     return model.to(config.device, dtype=config.dtype)
 
 
-def _build_tape_rnn(config: BaselineConfig) -> nn.Module:
-    model = TapeRNNSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(config.device, dtype=config.dtype)
-
-
-def _build_stack_rnn(config: BaselineConfig) -> nn.Module:
-    model = StackRNNSeq2Seq(config, **dict(config.model_kwargs))
-    return model.to(config.device, dtype=config.dtype)
-
-
 def _build_nca1d(config: BaselineConfig) -> nn.Module:
     model = NCA1DSeq2Seq(config, **dict(config.model_kwargs))
     return model.to(config.device, dtype=config.dtype)
 
 
+def _build_rnn_ar(config: BaselineConfig) -> nn.Module:
+    kwargs = dict(config.model_kwargs)
+    kwargs.setdefault("teacher_forcing", True)
+    return RNNSeq2SeqAutoregressive(config, **kwargs).to(config.device, dtype=config.dtype)
+
+
 BASELINE_REGISTRY: Dict[str, Callable[[BaselineConfig], nn.Module]] = {
     "rnn": _build_rnn,
     "transformer": _build_transformer,
+    "transformer_ar": _build_transformer_ar,
     "cnn1d": _build_cnn,
     "tiny_recursive": _build_tiny_recursive,
     "trm": _build_tiny_recursive,
     "hrm": _build_hierarchical_recursive,
     "transformer_act": _build_transformer_act,
-    "tape_rnn": _build_tape_rnn,
-    "stack_rnn": _build_stack_rnn,
     "nca1d": _build_nca1d,
+    "rnn_ar": _build_rnn_ar,
 }
 
 
@@ -512,12 +804,12 @@ __all__ = [
     "BASELINE_REGISTRY",
     "CNN1DSeq2Seq",
     "RNNSeq2Seq",
+    "RNNSeq2SeqAutoregressive",
     "TinyRecursiveSeq2Seq",
     "HierarchicalReasoningSeq2Seq",
     "TransformerACTSeq2Seq",
-    "TapeRNNSeq2Seq",
-    "StackRNNSeq2Seq",
     "TransformerSeq2Seq",
+    "TransformerEncoderSeq2Seq",
     "NCA1DSeq2Seq",
     "create_baseline",
     "get_baseline_registry",

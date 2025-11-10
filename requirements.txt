@@ -1,0 +1,15 @@
+# Core training dependencies
+torch>=2.0
+numpy
+hydra-core
+omegaconf
+pydantic
+einops
+tqdm
+cellarc
+huggingface_hub
+
+# Optional logging / tracking
+wandb
+openai>=1.30.0
+python-dotenv>=1.0

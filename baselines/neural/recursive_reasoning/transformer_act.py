@@ -213,18 +213,22 @@ class Model_ACTV2_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = self.H_init.device
         return Model_ACTV2InnerCarry(
             z_H=torch.empty(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
+                device=device,
             ),
         )
 
     def reset_carry(self, reset_flag: torch.Tensor, carry: Model_ACTV2InnerCarry):
+        init_state = self.H_init.to(device=carry.z_H.device, dtype=carry.z_H.dtype)
+        init_state = init_state.view(1, 1, -1)
         return Model_ACTV2InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_H=torch.where(reset_flag.view(-1, 1, 1), init_state, carry.z_H),
         )
 
     def forward(
@@ -266,14 +270,15 @@ class Model_ACTV2(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return Model_ACTV2Carry(
             inner_carry=self.inner.empty_carry(
                 batch_size
             ),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),  # Default to halted
-            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size,), dtype=torch.bool, device=device),  # Default to halted
+            current_data={k: torch.empty_like(v, device=device) for k, v in batch.items()},
         )
 
     def forward(
@@ -285,7 +290,7 @@ class Model_ACTV2(nn.Module):
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
 
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
 
         new_current_data = {
             k: torch.where(carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v)

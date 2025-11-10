@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 import logging
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 Symbol = int
@@ -54,8 +55,6 @@ class LearnedLocalMap:
     def _majority_symbol(self) -> Symbol:
         if not self.mapping:
             return 0
-        from collections import Counter
-
         return Counter(self.mapping.values()).most_common(1)[0][0]
 
     def predict(
@@ -159,29 +158,37 @@ def learn_local_map_from_pairs(
     wrap: bool = True,
     alphabet_size: Optional[int] = None,
     windows_total: Optional[int] = None,
+    *,
+    strict: bool = True,
 ) -> LearnedLocalMap:
     """
-    Learn F: (length-W window) -> output, using only *interior* indices so we never
-    depend on per-segment wrap. With context-added segments, this recovers all k**W windows.
+    Learn F: (length-W window) -> output for each observed position in the training pairs.
+
+    When ``strict`` is ``True`` (default), encountering the same window with two
+    different outputs raises a ``ValueError``. When ``False``, the solver keeps
+    counts for each window and later chooses the most common output symbol.
     """
-    table: Dict[Window, Symbol] = {}
-    half = W // 2
+    counters: Dict[Window, Counter[Symbol]] = {}
     for x, y in train_pairs:
         if len(x) != len(y):
             raise ValueError("Input/output lengths in a training pair must match.")
         n = len(x)
-        for i in range(half, n - half):
-            win = _centered_window(x, i, W, wrap=True)
+        for i in range(n):
+            win = _centered_window(x, i, W, wrap=wrap)
             val = y[i]
-            prev = table.get(win)
-            if prev is None:
-                table[win] = val
-            elif prev != val:
-                raise ValueError(f"Inconsistent mapping for window {win}: saw {prev} then {val}.")
+            counter = counters.setdefault(win, Counter())
+            counter[val] += 1
+            if strict and len(counter) > 1:
+                seen = list(counter.keys())
+                raise ValueError(
+                    f"Inconsistent mapping for window {win}: "
+                    f"observed multiple outputs {sorted(seen)}."
+                )
+    mapping = {win: counter.most_common(1)[0][0] for win, counter in counters.items()}
     return LearnedLocalMap(
         W=W,
         wrap=wrap,
-        mapping=table,
+        mapping=mapping,
         alphabet_size=alphabet_size,
         windows_total=windows_total,
         alphabet=None,
@@ -271,6 +278,7 @@ def learn_from_record(rec: dict) -> LearnedLocalMap:
         wrap=wrap,
         alphabet_size=k,
         windows_total=windows_total,
+        strict=False,
     )
     model.alphabet = alphabet
     model.rng_seed = episode_seed

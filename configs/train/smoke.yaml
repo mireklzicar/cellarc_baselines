@@ -25,6 +25,13 @@ trainer:
 eval:
   batch_size: 2
   limit: 16
+  tta:
+    enabled: false
+    num_augs: 16
+    use_palette: true
+    use_reverse: true
+    vote: "majority"
+    apply_to: "query_only"
 
 test:
   batch_size: 2
