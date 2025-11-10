@@ -1,5 +1,9 @@
 # cellarc_baselines
 
+This repository contains model training and baselines for CellARC:
+- Dataset repo: https://github.com/mireklzicar/cellarc 
+- Website: https://cellarc.mireklzicar.com/
+
 ## Wandb Results
 
 | Project | Size | Training Mode | W&B URL |
