@@ -1,0 +1,5 @@
+model,test_interpolation_token_accuracy,test_extrapolation_token_accuracy
+copycat,0.327056,0.180161
+most_frequent,0.504370,0.282011
+de_bruijn,0.524732,0.298223
+random,0.296603,0.176131

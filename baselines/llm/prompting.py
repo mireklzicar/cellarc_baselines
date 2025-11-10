@@ -44,7 +44,10 @@ class PromptBuilder:
         self._instructions = (config.instructions or "").strip()
         if not self._instructions:
             raise ValueError("Prompt instructions must be a non-empty string.")
-        self._system_message = (config.system_message or DEFAULT_SYSTEM_MESSAGE).strip()
+        if config.system_message is None:
+            self._system_message = DEFAULT_SYSTEM_MESSAGE
+        else:
+            self._system_message = config.system_message.strip()
         self._response_hint = (config.response_format_hint or DEFAULT_RESPONSE_HINT).strip()
 
     def build_prompt(self, episode: Mapping[str, Any]) -> PromptSpec:
@@ -66,8 +69,6 @@ class PromptBuilder:
                 lines.append("")
 
         if train_pairs:
-            lines.append("Training examples:")
-            lines.append("")
             for index, pair in enumerate(train_pairs, start=1):
                 input_seq = _format_sequence(pair.get("input", []))
                 output_seq = _format_sequence(pair.get("output", []))
@@ -79,17 +80,16 @@ class PromptBuilder:
                 lines.append(output_seq)
                 lines.append("")
         else:
-            lines.append("No training examples were provided. Rely on your reasoning ability.")
+            lines.append("No examples were provided. Rely on your reasoning ability.")
             lines.append("")
 
         lines.append(
-            "Below is the test input sequence. Predict the matching output sequence by applying the inferred rule."
+            "Below is the test input sequence. Predict the corresponding output sequence."
         )
-        lines.append("")
-        lines.append("Test Input:")
-        lines.append(_format_sequence(query))
-        lines.append("")
         lines.append(self._response_hint)
+        lines.append("")
+        lines.append("Input:")
+        lines.append(_format_sequence(query))
 
         user_prompt = "\n".join(lines).strip()
         return PromptSpec(system=self._system_message, user=user_prompt)

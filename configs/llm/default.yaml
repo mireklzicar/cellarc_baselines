@@ -20,13 +20,9 @@ llm:
 
 prompt:
   instructions_path: baselines/llm/prompts/prompt_example.md
-  system_message: >
-    You are a careful assistant that solves Cellular ARC tasks by analyzing the
-    provided 1D examples and applying the inferred rule to the test input. Think
-    through the mapping but return only the final answer.
+  system_message: ""
   response_format_hint: >
-    Respond only with the predicted output sequence as space-separated integers
-    (e.g., `3 1 2 0 1`).
+    Your final answer should just be the text output sequence itself.
   max_train_examples: 8
   include_episode_id: false
 

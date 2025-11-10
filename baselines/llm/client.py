@@ -137,18 +137,24 @@ class OpenAIClient:
         return await self._call_chat_api_async(system_prompt, user_prompt)
 
     def _build_responses_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "input": [
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append(
                 {
                     "role": "system",
                     "content": [{"type": "input_text", "text": system_prompt}],
-                },
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": user_prompt}],
-                },
-            ],
+                }
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            }
+        )
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "input": messages,
             "max_output_tokens": self._config.max_output_tokens,
             "timeout": self._config.request_timeout,
         }
@@ -191,12 +197,14 @@ class OpenAIClient:
         return text
 
     def _call_chat_api(self, system_prompt: str, user_prompt: str) -> str:
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
         kwargs: dict[str, Any] = {
             "model": self._config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
             "max_completion_tokens": self._config.max_output_tokens,
             "timeout": self._config.request_timeout,
         }
@@ -222,12 +230,14 @@ class OpenAIClient:
         return text
 
     async def _call_chat_api_async(self, system_prompt: str, user_prompt: str) -> str:
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
         kwargs: dict[str, Any] = {
             "model": self._config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
             "max_completion_tokens": self._config.max_output_tokens,
             "timeout": self._config.request_timeout,
         }

@@ -1,0 +1,39 @@
+{
+  "baseline": {
+    "name": "de_bruijn",
+    "kwargs": {
+      "fallback": "majority",
+      "default_symbol": 0
+    }
+  },
+  "benchmark": "cellarc_100k",
+  "splits": [
+    {
+      "split": "test_interpolation",
+      "episodes": 1000,
+      "solved": 27,
+      "episode_accuracy": 0.027,
+      "token_total": 11099,
+      "token_correct": 5824,
+      "token_accuracy": 0.5247319578340391
+    },
+    {
+      "split": "test_extrapolation",
+      "episodes": 1000,
+      "solved": 1,
+      "episode_accuracy": 0.001,
+      "token_total": 10918,
+      "token_correct": 3256,
+      "token_accuracy": 0.2982231177871405
+    }
+  ],
+  "overall": {
+    "episodes": 2000,
+    "solved": 28,
+    "episode_accuracy": 0.014,
+    "token_total": 22017,
+    "token_correct": 9080,
+    "token_accuracy": 0.4124085933596766
+  },
+  "max_episodes": null
+}

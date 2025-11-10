@@ -1,0 +1,41 @@
+project,training_mode,size,run_id,run_name,state,created_at,runtime_seconds,batch_size,test_extrapolation_accuracy,test_interpolation_accuracy,num_parameters
+cellarc100k_50e_embedding_large,embedding,large,73v4z0t8,cnn1d_large_embedding,finished,2025-11-06T10:07:25Z,9084.6709473133,768.0,0.2899798498,0.5266240202,10348305
+cellarc100k_50e_embedding_large,embedding,large,yxcwjjyz,hrm_large_embedding,finished,2025-11-06T18:10:27Z,21445.722145578,768.0,0.2818281737,0.5077934949,11152642
+cellarc100k_50e_embedding_large,embedding,large,5k2a3d4o,rnn_large_embedding,finished,2025-11-06T14:38:27Z,7475.3870515823,768.0,0.2794467851,0.5102261465,9580049
+cellarc100k_50e_embedding_large,embedding,large,z4hypfe3,tiny_recursive_large_embedding,finished,2025-11-07T13:07:15Z,37900.179514506,192.0,0.2641509434,0.4871610055,9516418
+cellarc100k_50e_embedding_large,embedding,large,diwgak5a,transformer_act_large_embedding,finished,2025-11-06T18:49:51Z,8323.873187359,768.0,0.2724858033,0.5077033967,8861186
+cellarc100k_50e_embedding_large,embedding,large,ypqhchfs,transformer_large_embedding,finished,2025-11-06T01:41:02Z,36468.4741680622,768.0,0.3237772486,0.5796017659,9666065
+cellarc100k_50e_embedding_medium,embedding,medium,42gkfx6k,cnn1d_medium_embedding,finished,2025-11-06T05:24:22Z,4046.8472027779,768.0,0.283660011,0.5156320389,1085617
+cellarc100k_50e_embedding_medium,embedding,medium,r97m1wg0,cnn1d_medium_embedding,finished,2025-11-06T17:24:48Z,4076.6132807732,768.0,0.283660011,0.5156320389,1085617
+cellarc100k_50e_embedding_medium,embedding,medium,iwwqy6bl,hrm_medium_embedding,finished,2025-11-06T07:29:40Z,13031.9717590809,768.0,0.2710203334,0.4891431661,888194
+cellarc100k_50e_embedding_medium,embedding,medium,rgwwr0z9,rnn_medium_embedding,finished,2025-11-06T11:49:05Z,3586.3450746536,768.0,0.2797215607,0.5077934949,1096209
+cellarc100k_50e_embedding_medium,embedding,medium,7p7wmx7d,tiny_recursive_medium_embedding,finished,2025-11-06T18:33:00Z,54381.1537852287,768.0,0.2892471149,0.5018470132,891650
+cellarc100k_50e_embedding_medium,embedding,medium,dn7xmv09,transformer_act_medium_embedding,finished,2025-11-06T17:24:48Z,18728.3562736511,768.0,0.2717530683,0.4889629696,906882
+cellarc100k_50e_embedding_medium,embedding,medium,9g9ort25,transformer_medium_embedding,finished,2025-11-06T01:41:02Z,9879.510607481,768.0,0.2883311962,0.5146409586,1061393
+cellarc100k_50e_embedding_small,embedding,small,5ztvsq38,cnn1d_small_embedding,finished,2025-11-06T06:20:17Z,2971.5145795345,768.0,0.2993222202,0.5114875214,112113
+cellarc100k_50e_embedding_small,embedding,small,6928s11w,hrm_small_embedding,finished,2025-11-06T12:39:05Z,7847.8476104736,768.0,0.2788056421,0.5068925128,166754
+cellarc100k_50e_embedding_small,embedding,small,jibqulw3,nca1d_small_embedding,finished,2025-11-07T17:24:08Z,29617.4603641033,192.0,0.2886975637,0.5028380935,110033
+cellarc100k_50e_embedding_small,embedding,small,v72atwiu,rnn_small_embedding,finished,2025-11-06T02:46:30Z,4541.0601465702,768.0,0.2755083349,0.5067123164,117297
+cellarc100k_50e_embedding_small,embedding,small,mgcrzxui,tiny_recursive_small_embedding,finished,2025-11-06T18:24:11Z,21872.8599281311,768.0,0.2174390914,0.396882602,133378
+cellarc100k_50e_embedding_small,embedding,small,4t740j53,transformer_act_small_embedding,finished,2025-11-06T05:18:34Z,3686.2658557892,768.0,0.2785308665,0.503919272,133378
+cellarc100k_50e_embedding_small,embedding,small,0pk6nxg9,transformer_small_embedding,finished,2025-11-06T13:13:29Z,5083.934766531,768.0,0.2962080967,0.5080637895,106417
+cellarc100k_50e_incontext_large,in context,large,nwlbcmov,cnn1d_large_incontext,finished,2025-11-06T18:10:53Z,1852.945209329,768.0,0.186114673,0.4672493017,10348305
+cellarc100k_50e_incontext_large,in context,large,c1gj0qnw,hrm_large_incontext,finished,2025-11-08T00:27:11Z,1982.379879056,768.0,0.3006960982,0.5092350662,11152642
+cellarc100k_50e_incontext_large,in context,large,wvcxmgcg,rnn_large_incontext,finished,2025-11-06T01:41:02Z,2347.923586607,768.0,0.2745924162,0.5075232003,9580049
+cellarc100k_50e_incontext_large,in context,large,4u2h0var,tiny_recursive_large_incontext,finished,2025-11-06T20:56:15Z,30876.123552423,192.0,0.2896134823,0.5088746734,9516418
+cellarc100k_50e_incontext_large,in context,large,7wv2mkt8,transformer_act_large_incontext,finished,2025-11-06T18:10:26Z,2358.110495699,768.0,0.3034438542,0.5104964411,8861186
+cellarc100k_50e_incontext_large,in context,large,nmm8oxd0,transformer_large_incontext,finished,2025-11-06T18:10:26Z,3789.186763562,768.0,0.2834768273,0.5099558519,9666065
+cellarc100k_50e_incontext_medium,in context,medium,gk17j6yf,cnn1d_medium_incontext,finished,2025-11-06T02:20:26Z,1546.3329753876,768.0,0.1295108994,0.4359852239,1085617
+cellarc100k_50e_incontext_medium,in context,medium,24zw2w1s,hrm_medium_incontext,finished,2025-11-06T06:32:43Z,3401.2087726593,768.0,0.2910789522,0.5116677178,888194
+cellarc100k_50e_incontext_medium,in context,medium,29aprlmn,rnn_medium_incontext,finished,2025-11-06T12:49:07Z,1446.7819609642,768.0,0.2748671918,0.5059915308,1096209
+cellarc100k_50e_incontext_medium,in context,medium,45y8y427,tiny_recursive_medium_incontext,finished,2025-11-06T11:36:08Z,12662.0706453323,768.0,0.2875984613,0.5101360483,891650
+cellarc100k_50e_incontext_medium,in context,medium,7iuekwz0,transformer_act_medium_incontext,finished,2025-11-06T04:49:04Z,2100.8749713898,768.0,0.300146547,0.5092350662,906882
+cellarc100k_50e_incontext_medium,in context,medium,br2xazqf,transformer_medium_incontext,finished,2025-11-06T04:02:28Z,2781.5176486969,768.0,0.2952921781,0.5104964411,1061393
+cellarc100k_50e_incontext_small,in context,small,h62zdwp0,cnn1d_small_incontext,finished,2025-11-06T04:56:19Z,1318.2546849251,768.0,0.1069793002,0.425173439,112113
+cellarc100k_50e_incontext_small,in context,small,1dannlx1,hrm_small_incontext,finished,2025-11-06T09:27:08Z,2389.2000567913,768.0,0.2673566587,0.4967114154,166754
+cellarc100k_50e_incontext_small,in context,small,ldmx16ap,nca1d_small_incontext,finished,2025-11-07T17:24:42Z,7510.2678468227,192.0,0.1680710753,0.4613929183,110033
+cellarc100k_50e_incontext_small,in context,small,s2ki8l00,rnn_small_incontext,finished,2025-11-06T11:07:50Z,1680.9388523102,768.0,0.2544422055,0.4985133796,117297
+cellarc100k_50e_incontext_small,in context,small,mv1ynbpk,rnn_small_incontext,finished,2025-11-06T17:53:14Z,1841.9468202591,768.0,0.2544422055,0.4985133796,117297
+cellarc100k_50e_incontext_small,in context,small,1fju31la,tiny_recursive_small_incontext,finished,2025-11-06T14:50:08Z,5707.6020789146,768.0,0.2866825426,0.5062618254,133378
+cellarc100k_50e_incontext_small,in context,small,f38l8dj2,transformer_act_small_incontext,finished,2025-11-06T17:24:47Z,1691.5633831024,768.0,0.2948342187,0.5088746734,133378
+cellarc100k_50e_incontext_small,in context,small,mmpljb84,transformer_small_incontext,finished,2025-11-06T04:25:59Z,1802.7735369205,768.0,0.2878732369,0.5102261465,106417

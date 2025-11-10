@@ -1,0 +1,39 @@
+{
+  "baseline": {
+    "name": "copycat",
+    "kwargs": {
+      "fallback": "majority",
+      "default_symbol": 0
+    }
+  },
+  "benchmark": "cellarc_100k",
+  "splits": [
+    {
+      "split": "test_interpolation",
+      "episodes": 1000,
+      "solved": 0,
+      "episode_accuracy": 0.0,
+      "token_total": 11099,
+      "token_correct": 3630,
+      "token_accuracy": 0.3270564915758176
+    },
+    {
+      "split": "test_extrapolation",
+      "episodes": 1000,
+      "solved": 0,
+      "episode_accuracy": 0.0,
+      "token_total": 10918,
+      "token_correct": 1967,
+      "token_accuracy": 0.18016120168529035
+    }
+  ],
+  "overall": {
+    "episodes": 2000,
+    "solved": 0,
+    "episode_accuracy": 0.0,
+    "token_total": 22017,
+    "token_correct": 5597,
+    "token_accuracy": 0.25421265385838215
+  },
+  "max_episodes": null
+}
