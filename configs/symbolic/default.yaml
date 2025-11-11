@@ -21,6 +21,7 @@ eval:
   max_episodes: null
   progress_bar: true
   results_json_path: null
+  per_task_results_dir: null
 
 logging:
   level: info

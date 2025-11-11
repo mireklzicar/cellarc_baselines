@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Mapping, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -39,6 +39,7 @@ class SplitMetrics:
     solved: int = 0
     token_total: int = 0
     token_correct: int = 0
+    per_task: Optional[List[dict[str, Any]]] = None
 
     @property
     def episode_accuracy(self) -> float:
@@ -59,6 +60,40 @@ def _maybe_len(obj: Iterable[Any]) -> Optional[int]:
 def _normalize_split_name(split: str) -> str:
     parts = split.lower().replace("-", "_").replace("/", "_").split()
     return "_".join(part for part in parts if part)
+
+
+def _extract_episode_id(episode: Any, fallback: str) -> str:
+    candidates = ("episode_id", "id", "episode_uid")
+    mapping: Optional[Mapping[str, Any]] = None
+    if isinstance(episode, Mapping):
+        mapping = episode
+    else:
+        try:
+            mapping = dict(episode)
+        except Exception:
+            mapping = None
+
+    if mapping is not None:
+        for key in candidates:
+            value = mapping.get(key)
+            if value:
+                return str(value)
+
+    for key in candidates:
+        try:
+            value = episode[key]  # type: ignore[index]
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        try:
+            value = getattr(episode, key)
+            if value:
+                return str(value)
+        except Exception:
+            pass
+
+    return fallback
 
 
 def _load_dataset_with_fallback(cfg: DictConfig, split: str) -> EpisodeDataset:
@@ -110,7 +145,13 @@ def _load_dataset_with_fallback(cfg: DictConfig, split: str) -> EpisodeDataset:
     )
 
 
-def evaluate_split(cfg: DictConfig, split: str, solver: SymbolicSolver) -> SplitMetrics:
+def evaluate_split(
+    cfg: DictConfig,
+    split: str,
+    solver: SymbolicSolver,
+    *,
+    collect_per_task: bool = False,
+) -> SplitMetrics:
     dataset = _load_dataset_with_fallback(cfg, split)
 
     max_episodes = cfg.eval.max_episodes
@@ -123,6 +164,7 @@ def evaluate_split(cfg: DictConfig, split: str, solver: SymbolicSolver) -> Split
     else:
         iterator = dataset
 
+    per_task_records: Optional[List[dict[str, Any]]] = [] if collect_per_task else None
     metrics = SplitMetrics(split=split)
 
     for index, episode in enumerate(iterator):
@@ -144,10 +186,35 @@ def evaluate_split(cfg: DictConfig, split: str, solver: SymbolicSolver) -> Split
 
         pred_tokens = list(iter_symbols(prediction))
         target_tokens = list(iter_symbols(target))
-        for pred_symbol, target_symbol in zip_longest(pred_tokens, target_tokens, fillvalue=None):
+        episode_token_total = 0
+        episode_token_correct = 0
+        for pred_symbol, target_symbol in zip_longest(
+            pred_tokens, target_tokens, fillvalue=None
+        ):
             metrics.token_total += 1
+            episode_token_total += 1
             if pred_symbol == target_symbol:
                 metrics.token_correct += 1
+                episode_token_correct += 1
+
+        if collect_per_task and per_task_records is not None:
+            episode_id = _extract_episode_id(episode, f"{split}_{index}")
+            episode_accuracy = (
+                (episode_token_correct / episode_token_total) if episode_token_total else 0.0
+            )
+            per_task_records.append(
+                {
+                    "episode_id": episode_id,
+                    "episode_index": index,
+                    "token_correct": episode_token_correct,
+                    "token_total": episode_token_total,
+                    "token_accuracy": episode_accuracy,
+                    "solved": prediction == target,
+                }
+            )
+
+    if collect_per_task:
+        metrics.per_task = per_task_records or []
 
     return metrics
 
@@ -225,6 +292,26 @@ def _write_results_json(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def _write_per_task_results(cfg: DictConfig, metrics: SplitMetrics) -> None:
+    per_task_dir = getattr(cfg.eval, "per_task_results_dir", None)
+    if not per_task_dir or not metrics.per_task:
+        return
+    output_dir = Path(to_absolute_path(str(per_task_dir)))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{cfg.baseline.name}__{metrics.split}_per_task_accuracy.json"
+    output_path = output_dir / filename
+    payload = {
+        "baseline": cfg.baseline.name,
+        "split": metrics.split,
+        "episodes": metrics.episodes,
+        "per_task_accuracy": metrics.per_task,
+    }
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    LOGGER.info("Wrote per-task accuracies to %s", output_path)
+
+
 @hydra.main(config_path="../configs/symbolic", config_name="default", version_base=None)
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(level=getattr(logging, str(cfg.logging.level).upper(), logging.INFO))
@@ -234,6 +321,7 @@ def main(cfg: DictConfig) -> None:
         ", ".join(cfg.splits),
     )
 
+    collect_per_task = bool(getattr(cfg.eval, "per_task_results_dir", None))
     results: List[SplitMetrics] = []
     for split in cfg.splits:
         LOGGER.info("Starting split %s", split)
@@ -243,7 +331,7 @@ def main(cfg: DictConfig) -> None:
             else {}
         )
         solver = create_symbolic_baseline(cfg.baseline.name, **(solver_kwargs or {}))
-        metrics = evaluate_split(cfg, split, solver)
+        metrics = evaluate_split(cfg, split, solver, collect_per_task=collect_per_task)
         results.append(metrics)
         LOGGER.info(
             "Split %s — solved %s/%s episodes (%s), token accuracy %s",
@@ -253,6 +341,8 @@ def main(cfg: DictConfig) -> None:
             format_percentage(metrics.episode_accuracy),
             format_percentage(metrics.token_accuracy),
         )
+        if collect_per_task:
+            _write_per_task_results(cfg, metrics)
 
     overall_summary = _aggregate_overall(results)
 

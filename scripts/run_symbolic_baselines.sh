@@ -3,11 +3,66 @@ set -euo pipefail
 
 # Execute all symbolic baselines over the full evaluation splits.
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_symbolic_baselines.sh [--per-task-dir DIR] [--splits split_a,split_b]
+
+Options:
+  --per-task-dir DIR   Directory where per-task accuracy JSON files should be written.
+  --splits LIST        Comma-separated list of splits to evaluate (defaults to config file).
+  -h, --help           Show this help text.
+EOF
+}
+
+PER_TASK_DIR=""
+SPLITS_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --per-task-dir)
+      PER_TASK_DIR="${2:-}"
+      shift 2
+      ;;
+    --splits)
+      SPLITS_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${REPO_ROOT}/outputs/symbolic"
 SUMMARY_CSV="${RESULTS_DIR}/symbolic_baselines_summary.csv"
 
 mkdir -p "${RESULTS_DIR}"
+
+HYDRA_SPLITS_ARG=""
+if [[ -n "${SPLITS_OVERRIDE}" ]]; then
+  IFS=',' read -r -a USER_SPLITS <<< "${SPLITS_OVERRIDE}"
+  if [[ ${#USER_SPLITS[@]} -eq 0 ]]; then
+    echo "No splits provided to --splits option." >&2
+    exit 1
+  fi
+  SPLIT_LIST="["
+  for split_name in "${USER_SPLITS[@]}"; do
+    if [[ -z "${split_name}" ]]; then
+      continue
+    fi
+    SPLIT_LIST+="${split_name},"
+  done
+  SPLIT_LIST="${SPLIT_LIST%,}"
+  SPLIT_LIST+="]"
+  HYDRA_SPLITS_ARG="splits=${SPLIT_LIST}"
+fi
 
 declare -a SYMBOLIC_BASELINES=(
   "copycat"
@@ -19,11 +74,24 @@ declare -a SYMBOLIC_BASELINES=(
 for baseline in "${SYMBOLIC_BASELINES[@]}"; do
   echo "=== Evaluating symbolic baseline: ${baseline} ==="
   results_json="${RESULTS_DIR}/${baseline}_results.json"
-  python "${REPO_ROOT}/scripts/eval_symbolic.py" \
-    baseline.name="${baseline}" \
-    eval.progress_bar=true \
-    eval.max_episodes=null \
+  declare -a HYDRA_OVERRIDES=()
+  if [[ -n "${HYDRA_SPLITS_ARG}" ]]; then
+    HYDRA_OVERRIDES+=("${HYDRA_SPLITS_ARG}")
+  fi
+  if [[ -n "${PER_TASK_DIR}" ]]; then
+    HYDRA_OVERRIDES+=("eval.per_task_results_dir=${PER_TASK_DIR}")
+  fi
+  cmd=(
+    python "${REPO_ROOT}/scripts/eval_symbolic.py"
+    baseline.name="${baseline}"
+    eval.progress_bar=true
+    eval.max_episodes=null
     eval.results_json_path="${results_json}"
+  )
+  if [[ ${#HYDRA_OVERRIDES[@]} -gt 0 ]]; then
+    cmd+=("${HYDRA_OVERRIDES[@]}")
+  fi
+  "${cmd[@]}"
 done
 
 echo "=== Writing symbolic baseline summary to ${SUMMARY_CSV} ==="

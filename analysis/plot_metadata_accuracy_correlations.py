@@ -65,16 +65,6 @@ def _family_color_map(families: List[str]) -> Dict[str, str]:
     return {family: colors[idx % len(colors)] for idx, family in enumerate(families)}
 
 
-def _legend_columns(count: int) -> int:
-    if count > 14:
-        return 4
-    if count > 9:
-        return 3
-    if count > 5:
-        return 2
-    return 1
-
-
 def _download_metadata(repo_id: str, split: str) -> Path:
     """Download the JSONL file for the requested split from the HF Hub."""
     filename = f"data/{split}.jsonl"
@@ -226,7 +216,7 @@ def _plot_family_distributions(
     family_labels = {family: _format_family_label(family) for family in families}
     family_colors = _family_color_map(families)
 
-    fig_width = 5.4 + max(0, len(models) - 1) * 3.8
+    fig_width = 5.4 + max(0, len(models) - 1) * 3.8 + 1.4
     fig_height = 4.2
     rc_overrides = {
         "axes.spines.top": False,
@@ -278,18 +268,18 @@ def _plot_family_distributions(
         legend_handles = [
             Patch(facecolor=family_colors[fam], edgecolor=family_colors[fam], label=family_labels[fam]) for fam in families
         ]
-        legend_cols = _legend_columns(len(legend_handles))
-        fig.legend(
+        legend_cols = 1
+        last_ax = axes[-1]
+        last_ax.legend(
             legend_handles,
             [family_labels[fam] for fam in families],
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.0),
+            loc="center left",
+            bbox_to_anchor=(0.96, 0.85),
             ncol=legend_cols,
             frameon=False,
-            title=f"CA family • split: {active_split_label}",
             fontsize=9,
         )
-        fig.subplots_adjust(left=0.08, right=0.99, top=0.96, bottom=0.28, wspace=0.08)
+        fig.subplots_adjust(left=0.08, right=0.88, top=0.95, bottom=0.14, wspace=0.08)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=250)
         plt.close(fig)
