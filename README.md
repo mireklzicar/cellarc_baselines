@@ -106,4 +106,8 @@ This repository contains model training and baselines for CellARC:
   ```bash
   SMOKE_TEST=true bash scripts/run_gpt_eval.sh
   ```
-- Batch multiple hosted LLMs via Hydra overrides (or reuse `scripts/run_llm_baselines.sh`) when you need to sweep model names.
+- Run Gemini 3 Pro: install deps (`pip install -r requirements.txt`) and export `GOOGLE_API_KEY` (or override `llm.api_key_env`), then:
+  ```bash
+  python scripts/eval_llm.py --config-name gemini3_pro
+  ```
+- Batch multiple hosted LLMs (OpenAI + Gemini) via Hydra overrides or set `LLM_CONFIGS="default gemini3_pro"` with `scripts/run_llm_baselines.sh` when you need to sweep model names.

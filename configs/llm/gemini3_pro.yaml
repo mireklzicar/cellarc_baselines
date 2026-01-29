@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - default
+  - _self_
+
+llm:
+  provider: gemini
+  model: gemini-3.0-pro
+  api_key_env: GOOGLE_API_KEY
+  temperature: null
+  top_p: null
+  top_k: null
+  max_output_tokens: 256
+  api_style: null
+  request_timeout: 60.0
+  max_retries: 2
+  retry_backoff: 2.0
+  stream: false
+  use_async: false
